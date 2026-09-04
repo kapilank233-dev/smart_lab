@@ -1,0 +1,91 @@
+.plagiarism-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.plagiarism-editor {
+  padding: 20px;
+}
+
+.plagiarism-editor textarea {
+  display: block;
+  width: 100%;
+  min-height: 260px;
+  resize: vertical;
+  padding: 13px;
+  border: 1px solid #dce8e2;
+  border-radius: 6px;
+  background: #172e2d;
+  color: #d8e8df;
+  font: 11px/1.7 Consolas, monospace;
+  outline: none;
+}
+
+.plagiarism-editor textarea:focus {
+  border-color: #4ca987;
+  box-shadow: 0 0 0 3px #e3f4ec;
+}
+
+.similarity-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 22px;
+}
+
+.similarity-result strong {
+  display: block;
+  margin-top: 5px;
+  color: #28745e;
+  font: 800 42px Manrope;
+}
+
+.similarity-result p {
+  margin-top: 6px;
+  color: #78918a;
+  font-size: 10px;
+}
+
+.similarity-meter {
+  width: min(360px, 40%);
+}
+
+.similarity-meter i {
+  display: block;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: #e4eee9;
+}
+
+.similarity-meter em {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #d4755e;
+}
+
+.similarity-meter span {
+  display: block;
+  margin-top: 7px;
+  color: #91a49d;
+  font-size: 9px;
+}
+
+@media (max-width: 760px) {
+  .plagiarism-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .similarity-result {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .similarity-meter {
+    width: 100%;
+  }
+}

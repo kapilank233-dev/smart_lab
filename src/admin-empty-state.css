@@ -1,0 +1,8 @@
+.management-table:has(.directory-head):not(:has(.directory-row))::after {
+  content: 'No records available yet';
+  display: block;
+  padding: 24px 10px;
+  color: #91a49d;
+  font-size: 10px;
+  text-align: center;
+}

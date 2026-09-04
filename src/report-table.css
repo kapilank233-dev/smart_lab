@@ -1,0 +1,16 @@
+.report-table .directory-head,
+.report-table .directory-row {
+  grid-template-columns: 1.5fr 1.2fr .7fr .7fr;
+}
+
+.report-table .directory-head span:nth-child(3),
+.report-table .directory-row > span:nth-child(3) {
+  display: none;
+}
+
+.report-empty {
+  padding: 24px 10px;
+  color: #91a49d;
+  font-size: 10px;
+  text-align: center;
+}

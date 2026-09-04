@@ -1,0 +1,133 @@
+.student-add-form {
+  margin-bottom: 18px;
+  padding: 22px;
+  border: 1px solid #cfe5da;
+  background: #f8fcfa;
+}
+
+.student-add-form .panel-heading {
+  margin-bottom: 18px;
+}
+
+.student-add-form .panel-heading h2 {
+  margin-bottom: 5px;
+}
+
+.student-add-form .panel-heading p {
+  color: #7d968d;
+  font-size: 10px;
+}
+
+.student-add-form .builder-fields {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 17px;
+}
+
+.student-add-form label {
+  display: block;
+  color: #4f6d63;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.student-add-form input,
+.student-add-form select {
+  display: block;
+  width: 100%;
+  min-height: 38px;
+  margin-top: 7px;
+  padding: 9px 10px;
+  border: 1px solid #d2e2db;
+  border-radius: 5px;
+  background: #fff;
+  color: #34544a;
+  font: 11px 'DM Sans';
+  outline: none;
+}
+
+.student-add-form input:focus,
+.student-add-form select:focus {
+  border-color: #4ca987;
+  box-shadow: 0 0 0 3px #e3f4ec;
+}
+
+.student-add-form .review-button {
+  width: auto;
+  min-width: 145px;
+  padding: 11px 16px;
+}
+
+.student-add-form .row-action {
+  margin-left: 12px;
+}
+
+.student-row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.student-row-actions .row-action {
+  padding: 4px 0;
+}
+
+.student-row-actions .delete-action {
+  color: #c56c58;
+}
+
+.login-error {
+  margin: -2px 0 12px;
+  padding: 9px 10px;
+  border: 1px solid #f1d2c9;
+  border-radius: 5px;
+  background: #fbe9e3;
+  color: #b65f4c;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.student-section-row.report-action {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid #edf1ef;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.student-section-row.report-action:hover {
+  background: #f2f8f4;
+}
+
+@media (max-width: 800px) {
+  .student-add-form .builder-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  .student-add-form {
+    padding: 16px;
+  }
+
+  .student-add-form .builder-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .student-add-form .review-button {
+    width: 100%;
+  }
+
+  .student-add-form .row-action {
+    margin: 10px 0 0;
+  }
+
+  .student-row-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
