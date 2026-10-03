@@ -1,11 +1,9 @@
-import { StrictMode, useEffect, useState } from "react";
-import { createRoot } from "react-dom/client";
+import { useEffect, useRef, useState } from "react";
 import "./styles.css";
 import { supabase } from "./lib/supabase";
+import { assessSubmission } from "./lib/aiAssessment";
 
 const modules = [
-  { id: "overview", icon: "▦", label: "Overview" },
-  { id: "monitoring", icon: "◉", label: "Activity monitoring", badge: "LIVE" },
   { id: "assessment", icon: "✦", label: "AI assessment" },
   { id: "execution", icon: "▷", label: "Program execution" },
   { id: "storage", icon: "▱", label: "Data storage" },
@@ -35,6 +33,17 @@ const defaultEvaluation = {
   cases: defaultCases,
   status: "Published",
 };
+const emptyEvaluation = {
+  name: "",
+  question: "",
+  duration: 0,
+  testCases: 0,
+  cases: [],
+  status: "",
+  isActive: false,
+};
+const hasEvaluationContent = (evaluation) =>
+  Boolean(evaluation?.name?.trim() && evaluation?.question?.trim());
 let pythonRuntime;
 function loadPythonRuntime() {
   if (pythonRuntime) return pythonRuntime;
@@ -83,7 +92,7 @@ async function executePythonCases(source, cases) {
       results.push({
         input,
         expected,
-        actual: `RuntimeError: ${error.message}`,
+        actual: error instanceof Error ? error.message : "Execution failed",
         matched: false,
       });
     }
@@ -91,19 +100,222 @@ async function executePythonCases(source, cases) {
   return results;
 }
 
+function StructuredFeedback({ feedback, className = "" }) {
+  const normalizedFeedback = feedback
+    .replace(/\*{2}\s*(Summary|Strengths|Improvements|Next step)\s*\*{2}/gi, "\n$1\n")
+    .replace(/#{1,6}\s*(Summary|Strengths|Improvements|Next step)\s*(?::)?/gi, "\n$1\n")
+    .replace(/\r/g, "");
+  const parts = normalizedFeedback.split(
+    /(?:^|\n)\s*(Summary|Strengths|Improvements|Next step)\s*[:\-]?\s*/gi,
+  );
+  const sections = [];
+  for (let index = 1; index < parts.length; index += 2) {
+    sections.push({ title: parts[index], content: parts[index + 1] || "" });
+  }
+
+  if (!sections.length) {
+    return <p className={className}>{normalizedFeedback.replace(/\*{2}/g, "")}</p>;
+  }
+
+  return (
+    <div className={`structured-feedback ${className}`.trim()}>
+      {sections.map((section) => (
+        <section key={section.title}>
+          <strong>{section.title}</strong>
+          {(() => {
+            const content = section.content
+              .replace(/\*{2}/g, "")
+              .replace(/^\s*[-*]\s*(?:#{1,6}\s*)?(Summary|Strengths|Improvements|Next step)\s*:?\s*/gim, "")
+              .replace(/^\s*[-_=]+\s*/, "")
+              .trim();
+            const items = content
+              .split(/\s*(?:[-*])\s+/)
+              .map((item) => item.trim())
+              .filter(Boolean);
+            return items.length > 1 ? (
+              <ul>
+                {items.map((item) => <li key={item}>{item}</li>)}
+              </ul>
+            ) : (
+              <p>{content}</p>
+            );
+          })()}
+        </section>
+      ))}
+    </div>
+  );
+}
+
+async function reviewAiUsage(source) {
+  const response = await fetch(
+    import.meta.env.VITE_OLLAMA_URL || "http://localhost:11434/api/generate",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: import.meta.env.VITE_OLLAMA_MODEL || "llama3.2",
+        prompt: [
+          "Review this student code for signs that an AI assistant may have generated or substantially assisted it.",
+          "This is only a review signal. Do not claim certainty, authorship, or misconduct.",
+          "Return exactly these lines:",
+          "Signal: Likely AI-assisted, Inconclusive, or Likely human-written",
+          "Confidence: Low, Medium, or High",
+          "Evidence: one concise explanation grounded only in the code",
+          "Student code:",
+          source?.trim() || "[NO CODE SUBMITTED]",
+        ].join("\n\n"),
+        stream: false,
+      }),
+    },
+  );
+  const data = await response.json();
+  if (!response.ok || data.error) {
+    throw new Error(data.error || "AI usage review failed.");
+  }
+  return data.response?.trim() || "No AI usage review was returned.";
+}
+
 function Dashboard() {
   const [active, setActive] = useState("overview");
   const [mode, setMode] = useState("landing");
   const [studentTab, setStudentTab] = useState("dashboard");
   const [notice, setNotice] = useState("");
-  const [activeEvaluation, setActiveEvaluation] = useState(defaultEvaluation);
+  const [publishedEvaluations, setPublishedEvaluations] = useState(() => {
+    try {
+      const saved = JSON.parse(
+        window.localStorage.getItem("labpilot-published-evaluations") || "[]",
+      );
+      if (Array.isArray(saved) && saved.length) return saved;
+    } catch {
+      // Ignore malformed saved data and continue with defaults.
+    }
+    return [defaultEvaluation];
+  });
+  const [activeEvaluation, setActiveEvaluation] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem("labpilot-active-evaluation");
+      const parsed = saved ? JSON.parse(saved) : null;
+      if (hasEvaluationContent(parsed)) return parsed;
+    } catch {
+      // Ignore malformed saved data and continue with defaults.
+    }
+    return defaultEvaluation;
+  });
   const [evaluationSubmitted, setEvaluationSubmitted] = useState(false);
+  const [user, setUser] = useState(null);
+  const [userRole, setUserRole] = useState("student");
+  const [userDepartment, setUserDepartment] = useState("");
+  const [userLab, setUserLab] = useState("");
+
+  const mapEvaluationRecord = (item) => ({
+    name: item.name,
+    question: item.question,
+    duration: Number(item.duration) || 45,
+    testCases: Number(item.test_cases || item.cases?.length || 0),
+    cases: Array.isArray(item.cases) ? item.cases : [],
+    status: item.status || "Published",
+    isActive: Boolean(item.is_active),
+    assignedLab: item.assigned_lab || "",
+  });
+
+  const loadPublishedEvaluations = async () => {
+    if (!supabase || !user || mode !== "faculty") return;
+    let evaluationsQuery = supabase
+      .from("evaluations")
+      .select("*")
+      .order("published_at", { ascending: false });
+    if (userRole === "faculty" && userDepartment) {
+      evaluationsQuery = evaluationsQuery.eq("department", userDepartment);
+    }
+    if (userRole === "faculty" && userLab) {
+      evaluationsQuery = evaluationsQuery.eq("assigned_lab", userLab);
+    }
+    const { data, error } = await evaluationsQuery;
+    if (error) {
+      console.error("Failed to fetch evaluations", error);
+      return;
+    }
+    if (!Array.isArray(data) || !data.length) return;
+    const mapped = data.map(mapEvaluationRecord);
+    setPublishedEvaluations(mapped);
+    const activeRecord = mapped.find((evaluation) => evaluation.isActive) || mapped[0];
+    if (activeRecord) setActiveEvaluation(activeRecord);
+  };
+
+  const loadStudentEvaluations = async () => {
+    if (!supabase || !user || mode !== "student") return;
+    let evaluationsQuery = supabase
+      .from("evaluations")
+      .select("*")
+      .order("published_at", { ascending: false })
+    if (userDepartment) {
+      evaluationsQuery = evaluationsQuery.in("department", [userDepartment, "All departments"]);
+    }
+    if (userLab) {
+      evaluationsQuery = evaluationsQuery.in("assigned_lab", [userLab, "All labs"]);
+    }
+    const { data, error } = await evaluationsQuery;
+      ;
+    if (error) {
+      console.error("Failed to fetch student evaluations", error);
+      setPublishedEvaluations((current) =>
+        current.length ? current : [defaultEvaluation],
+      );
+      setActiveEvaluation((current) =>
+        hasEvaluationContent(current) ? current : defaultEvaluation,
+      );
+      return;
+    }
+    if (!Array.isArray(data) || !data.length) {
+      setPublishedEvaluations((current) =>
+        current.length ? current : [defaultEvaluation],
+      );
+      setActiveEvaluation((current) =>
+        hasEvaluationContent(current) ? current : defaultEvaluation,
+      );
+      return;
+    }
+    const mapped = data.map(mapEvaluationRecord);
+    setPublishedEvaluations(mapped);
+    const activeRecord = mapped.find((evaluation) => evaluation.isActive) || mapped[0];
+    if (activeRecord) setActiveEvaluation(activeRecord);
+  };
+
+  useEffect(() => {
+    if (!supabase || !user) {
+      setUserRole("student");
+      return undefined;
+    }
+    supabase
+      .from("student_profiles")
+      .select("role, department, assigned_lab")
+      .eq("id", user.id)
+      .maybeSingle()
+      .then(({ data }) => {
+        setUserRole(data?.role || "student");
+        setUserDepartment(data?.department || "");
+        setUserLab(data?.assigned_lab || "");
+      });
+    return undefined;
+  }, [user]);
+
+  useEffect(() => {
+    if (!supabase || !user || mode !== "faculty") return undefined;
+    loadPublishedEvaluations();
+    return undefined;
+  }, [mode, user, userRole, userDepartment, userLab]);
+
+  useEffect(() => {
+    if (!supabase || !user || mode !== "student") return undefined;
+    loadStudentEvaluations();
+    return undefined;
+  }, [mode, user, userDepartment, userLab]);
   const [submissionResult, setSubmissionResult] = useState(null);
+  const [submissionError, setSubmissionError] = useState("");
   const [studentEvaluation, setStudentEvaluation] = useState({
     code: "",
     caseResults: [],
   });
-  const [user, setUser] = useState(null);
   const [studentProfile, setStudentProfile] = useState(null);
   const [activeStudentCount, setActiveStudentCount] = useState(() =>
     Number(window.localStorage.getItem("labpilot-active-students") || 0),
@@ -120,11 +332,21 @@ function Dashboard() {
   const [needsReview, setNeedsReview] = useState(() =>
     Number(window.localStorage.getItem("labpilot-needs-review") || 0),
   );
-  const [activities, setActivities] = useState([]);
+  const [activities, setActivities] = useState(() => {
+    try {
+      return JSON.parse(window.localStorage.getItem("labpilot-activities") || "[]");
+    } catch {
+      return [];
+    }
+  });
   const [activeEvaluations, setActiveEvaluations] = useState(() =>
     Number(window.localStorage.getItem("labpilot-active-evaluations") || 0),
   );
   const [adminStudents, setAdminStudents] = useState([]);
+  const [facultyMembers, setFacultyMembers] = useState([]);
+  const [facultyRecords, setFacultyRecords] = useState([]);
+  const [aiUsageReports, setAiUsageReports] = useState({});
+  const [aiAssessment, setAiAssessment] = useState(null);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -151,6 +373,21 @@ function Dashboard() {
     );
   }, [activeEvaluations]);
   useEffect(() => {
+    window.localStorage.setItem(
+      "labpilot-published-evaluations",
+      JSON.stringify(publishedEvaluations),
+    );
+  }, [publishedEvaluations]);
+  useEffect(() => {
+    window.localStorage.setItem(
+      "labpilot-active-evaluation",
+      JSON.stringify(activeEvaluation),
+    );
+  }, [activeEvaluation]);
+  useEffect(() => {
+    window.localStorage.setItem("labpilot-activities", JSON.stringify(activities));
+  }, [activities]);
+  useEffect(() => {
     if (!supabase) return undefined;
     supabase.auth
       .getSession()
@@ -162,46 +399,694 @@ function Dashboard() {
   }, []);
   useEffect(() => {
     if (!supabase || !user || mode !== "faculty") return undefined;
+    let cancelled = false;
+    const loadAdminStudents = async () => {
+      const [{ data: profiles, error: profilesError }, { data: submissions, error: submissionsError }] =
+        await Promise.all([
+          supabase
+            .from("student_profiles")
+            .select("full_name, usn, semester, department, assigned_lab, id")
+            .eq("role", "student")
+            .order("created_at", { ascending: true }),
+          supabase
+            .from("submissions")
+            .select("id, student_id, score, passed, total, evaluation_name, code, case_results, created_at")
+            .order("created_at", { ascending: false }),
+        ]);
+      if (profilesError) {
+        console.error("Failed to load admin students", profilesError);
+        return;
+      }
+      if (submissionsError) {
+        console.error("Failed to load student submissions", submissionsError);
+      }
+      const submissionIds = (submissions || []).map((submission) => submission.id).filter(Boolean);
+      const [{ data: assessments }, { data: feedback }] = submissionIds.length
+        ? await Promise.all([
+            supabase
+              .from("ai_assessments")
+              .select("submission_id, feedback")
+              .in("submission_id", submissionIds),
+            supabase
+              .from("feedback")
+              .select("submission_id, content, created_at")
+              .in("submission_id", submissionIds)
+              .order("created_at", { ascending: false }),
+          ])
+        : [{ data: [] }, { data: [] }];
+      const assessmentMap = new Map((assessments || []).map((item) => [item.submission_id, item]));
+      const feedbackMap = new Map();
+      (feedback || []).forEach((item) => {
+        if (!feedbackMap.has(item.submission_id)) feedbackMap.set(item.submission_id, item);
+      });
+      const latestByStudent = new Map();
+      (submissions || []).forEach((submission) => {
+        if (!latestByStudent.has(submission.student_id)) {
+          latestByStudent.set(submission.student_id, {
+            ...submission,
+            assessment: assessmentMap.get(submission.id),
+            feedback: feedbackMap.get(submission.id),
+          });
+        }
+      });
+      if (!cancelled && profiles) {
+        setAdminStudents(profiles.map((student) => {
+          const submission = latestByStudent.get(student.id);
+          return [
+            student.full_name,
+            student.usn,
+            `${student.assigned_lab} · ${student.semester}`,
+            submission ? `${submission.score}%` : "--",
+            submission ? "Submitted" : "Not started",
+            student.department,
+            submission,
+            student.id,
+          ];
+        }));
+      }
+    };
+      const refreshOnFocus = () => loadAdminStudents();
+      window.addEventListener("focus", refreshOnFocus);
+      const refreshInterval = window.setInterval(loadAdminStudents, 5000);
+      const submissionChannel = supabase
+        .channel("faculty-student-submissions")
+        .on(
+          "postgres_changes",
+          { event: "INSERT", schema: "public", table: "submissions" },
+          () => loadAdminStudents(),
+        )
+        .subscribe();
+    loadAdminStudents();
+    return () => {
+        window.removeEventListener("focus", refreshOnFocus);
+        window.clearInterval(refreshInterval);
+        supabase.removeChannel(submissionChannel);
+      cancelled = true;
+    };
+  }, [activeEvaluation.name, mode, user]);
+  useEffect(() => {
+    if (!supabase || !user || mode !== "faculty" || userRole !== "admin") return undefined;
     supabase
       .from("student_profiles")
-      .select("full_name, usn, semester, assigned_lab")
-      .neq("role", "admin")
+      .select("id, full_name, usn, semester, department, assigned_lab")
+      .eq("role", "faculty")
       .order("created_at", { ascending: true })
-      .then(({ data }) => {
-        if (data) setAdminStudents(data.map((student) => [student.full_name, student.usn, `${student.assigned_lab} · ${student.semester}`, "--", "In Progress"]));
+      .then(({ data, error }) => {
+        if (error) console.error("Failed to load faculty accounts", error);
+        else if (data) setFacultyMembers(data.map((faculty) => ({ id: faculty.id, name: faculty.full_name, usn: faculty.usn, semester: faculty.semester, department: faculty.department, lab: faculty.assigned_lab })));
       });
     return undefined;
-  }, [mode, user]);
+  }, [mode, user, userRole]);
+  useEffect(() => {
+    if (!supabase || !user || mode !== "faculty") return undefined;
+    let cancelled = false;
+    const loadRecentActivity = async () => {
+      const [submissionsResult, profilesResult] = await Promise.all([
+        supabase
+          .from("submissions")
+          .select("student_id, evaluation_name, score, passed, total, created_at")
+          .order("created_at", { ascending: false })
+          .limit(20),
+        supabase.from("student_profiles").select("id, full_name, department").eq("role", "student"),
+      ]);
+      const { data: submissions, error: submissionsError } = submissionsResult;
+      const { data: profiles, error: profilesError } = profilesResult;
+      if (submissionsError) {
+        console.error("Failed to load recent submissions", submissionsError);
+        if (!cancelled) setActivities([]);
+        return;
+      }
+      const visibleProfiles = userRole === "faculty"
+        ? profilesError
+          ? []
+          : (profiles || []).filter((profile) => profile.department === userDepartment)
+        : profiles || [];
+      const names = new Map(visibleProfiles.map((profile) => [profile.id, profile.full_name]));
+      const formatTime = (createdAt) => {
+        const elapsedMinutes = Math.max(0, Math.floor((Date.now() - new Date(createdAt).getTime()) / 60000));
+        if (elapsedMinutes < 1) return "Just now";
+        if (elapsedMinutes < 60) return `${elapsedMinutes}m ago`;
+        const elapsedHours = Math.floor(elapsedMinutes / 60);
+        if (elapsedHours < 24) return `${elapsedHours}h ago`;
+        return `${Math.floor(elapsedHours / 24)}d ago`;
+      };
+      const realActivities = (submissions || [])
+        .filter((submission) => userRole !== "faculty" || profilesError || names.has(submission.student_id))
+        .map((submission) => {
+          const name = names.get(submission.student_id) || `Student ${submission.student_id.slice(0, 8)}`;
+          return {
+            initials: name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase(),
+            name,
+            task: submission.evaluation_name,
+            status: submission.passed === submission.total ? "Compiled" : "Review needed",
+            tone: submission.passed === submission.total ? "green" : "red",
+            time: formatTime(submission.created_at),
+          };
+        });
+      if (!cancelled) setActivities(realActivities);
+    };
+    loadRecentActivity();
+    const refreshInterval = window.setInterval(loadRecentActivity, 5000);
+    const submissionChannel = supabase
+      .channel("faculty-monitoring-submissions")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "submissions" },
+        loadRecentActivity,
+      )
+      .subscribe();
+    return () => {
+      cancelled = true;
+      window.clearInterval(refreshInterval);
+      supabase.removeChannel(submissionChannel);
+    };
+  }, [mode, user, userRole, userDepartment]);
+  useEffect(() => {
+    if (!supabase || !user || mode !== "faculty") return undefined;
+    let cancelled = false;
+    const loadFacultyRecords = async () => {
+      const [{ data: submissions }, { data: profiles }, { data: activitiesData }] = await Promise.all([
+        supabase.from("submissions").select("id, student_id, evaluation_name, score, passed, total, time_used, code, created_at").order("created_at", { ascending: false }),
+        supabase.from("student_profiles").select("id, full_name, usn, semester, department, assigned_lab").eq("role", "student"),
+        supabase.from("coding_activity").select("student_id, activity_type, metadata, created_at").order("created_at", { ascending: false }).limit(200),
+      ]);
+      const submissionIds = (submissions || []).map((submission) => submission.id);
+      const [{ data: compilations }, { data: executions }, { data: assessments }, { data: feedback }] = submissionIds.length
+        ? await Promise.all([
+            supabase.from("compilation_results").select("submission_id, success, errors, warnings, created_at").in("submission_id", submissionIds),
+            supabase.from("execution_results").select("submission_id, passed, total, case_results, duration_ms").in("submission_id", submissionIds),
+            supabase.from("ai_assessments").select("submission_id, skill_score, debugging_score, code_quality_score, plagiarism_score, performance_prediction, strengths, weaknesses, feedback").in("submission_id", submissionIds),
+            supabase.from("feedback").select("submission_id, content, created_at").in("submission_id", submissionIds),
+          ])
+        : [{ data: [] }, { data: [] }, { data: [] }, { data: [] }];
+      const visibleProfiles = userRole === "faculty"
+        ? (profiles || []).filter((profile) => profile.department === userDepartment)
+        : profiles || [];
+      const profileMap = new Map(visibleProfiles.map((profile) => [profile.id, profile]));
+      const latest = new Map();
+      (submissions || []).forEach((submission) => {
+        if (!latest.has(submission.student_id)) latest.set(submission.student_id, submission);
+      });
+      const bySubmission = (items) => new Map((items || []).map((item) => [item.submission_id, item]));
+      const compilationMap = bySubmission(compilations);
+      const executionMap = bySubmission(executions);
+      const assessmentMap = bySubmission(assessments);
+      const feedbackMap = bySubmission(feedback);
+      const activityMap = new Map();
+      (activitiesData || []).forEach((activity) => {
+        if (!activityMap.has(activity.student_id)) activityMap.set(activity.student_id, []);
+        activityMap.get(activity.student_id).push(activity);
+      });
+      const records = [...latest.values()].map((submission) => ({
+        ...submission,
+        profile: profileMap.get(submission.student_id),
+        compilation: compilationMap.get(submission.id),
+        execution: executionMap.get(submission.id),
+        assessment: assessmentMap.get(submission.id),
+        feedback: feedbackMap.get(submission.id),
+        activities: activityMap.get(submission.student_id) || [],
+      })).filter((record) => record.profile);
+      if (!cancelled) setFacultyRecords(records);
+    };
+    loadFacultyRecords();
+    return () => { cancelled = true; };
+  }, [mode, user, userRole, userDepartment]);
   useEffect(() => {
     if (!supabase || !user || mode !== "student") return undefined;
     supabase
       .from("student_profiles")
-      .select("full_name, usn, semester, assigned_lab")
+      .select("full_name, usn, semester, department, assigned_lab")
       .eq("id", user.id)
-      .single()
-      .then(({ data }) => setStudentProfile(data || null));
+      .maybeSingle()
+      .then(async ({ data, error }) => {
+        if (error) {
+          console.error("Failed to load student profile", error);
+          return;
+        }
+        if (data) {
+          setStudentProfile(data);
+          return;
+        }
+
+        const metadata = user.user_metadata || {};
+        const fallbackProfile = {
+          full_name: metadata.full_name || "Student",
+          usn: metadata.usn || "UNASSIGNED",
+          semester: metadata.semester || "Not specified",
+          department: metadata.department || "Computer Science",
+          assigned_lab: metadata.assigned_lab || "Data Structures",
+        };
+        setStudentProfile(fallbackProfile);
+
+        const { error: insertError } = await supabase
+          .from("student_profiles")
+          .insert({ id: user.id, ...fallbackProfile, role: "student" });
+        if (insertError && insertError.code !== "23505") {
+          console.error("Failed to create student profile", insertError);
+        }
+      });
     return undefined;
   }, [mode, user]);
+  useEffect(() => {
+    if (mode !== "student") return undefined;
+    setSubmissionResult(null);
+    setEvaluationSubmitted(false);
+    const restoreSubmission = (submission) => {
+      if (!submission) return;
+      setSubmissionResult({
+        score: submission.score,
+        passed: submission.passed,
+        total: submission.total,
+        timeUsed: submission.time_used ?? submission.timeUsed ?? 0,
+        timeUsedSeconds: submission.timeUsedSeconds,
+      });
+      setEvaluationSubmitted(true);
+      setStudentEvaluation({
+        code: submission.code || "",
+        caseResults: submission.case_results || submission.caseResults || [],
+      });
+    };
+    if (!supabase || !user) return undefined;
+    let cancelled = false;
+    supabase
+      .from("submissions")
+      .select("evaluation_name, score, passed, total, time_used, code, case_results, created_at")
+      .eq("student_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(20)
+      .then(({ data, error }) => {
+        if (error) {
+          console.error("Failed to load student results", error);
+          setSubmissionError(`Results could not be loaded: ${error.message}`);
+          return;
+        }
+        const submission = (data || []).find(
+          (item) => item.evaluation_name === activeEvaluation.name,
+        );
+        if (!cancelled && submission) restoreSubmission(submission);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeEvaluation.name, mode, studentProfile?.usn, user]);
 
   const signIn = async (portal, username, password) => {
     if (!supabase)
       return "Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local.";
-    const { error } = await supabase.auth.signInWithPassword({
-      email: portal === "student"
-        ? `${username.trim().toLowerCase()}@students.labpilot.local`
-        : username,
-      password,
-    });
-    if (error) return error.message;
+    const loginName = username.trim().toLowerCase();
+    const loginEmails = loginName.includes("@")
+      ? [loginName]
+      : portal === "student"
+        ? [`${loginName}@students.labpilot.local`]
+        : portal === "faculty"
+          ? [`${loginName}@faculty.labpilot.local`, `${loginName}@students.labpilot.local`]
+          : [loginName];
+    let error;
+    let signedInUser;
+    for (const email of loginEmails) {
+      let result;
+      try {
+        result = await supabase.auth.signInWithPassword({ email, password });
+      } catch (requestError) {
+        return requestError instanceof Error
+          ? requestError.message
+          : "Unable to reach Supabase. Check your connection and project configuration.";
+      }
+      if (!result.error && result.data?.user) {
+        signedInUser = result.data.user;
+        error = undefined;
+        break;
+      }
+      error = result.error;
+    }
+    if (error) {
+      if (error.message?.toLowerCase().includes("invalid login credentials")) {
+        return portal === "faculty"
+          ? "Invalid faculty login. Use the Faculty ID created by the administrator and its temporary password."
+          : "Invalid login credentials. Check your username and password.";
+      }
+      return error.message || "Unable to sign in. Please try again.";
+    }
+    if (!signedInUser) {
+      return "The account session could not be created.";
+    }
+    const { data: profile, error: profileError } = await supabase
+      .from("student_profiles")
+      .select("role, department")
+      .eq("id", signedInUser?.id)
+      .maybeSingle();
+    if (profileError) {
+      await supabase.auth.signOut();
+      return `Your account was authenticated, but its profile could not be loaded: ${profileError.message}`;
+    }
+    const expectedRole = portal === "faculty" ? "faculty" : portal === "admin" ? "admin" : "student";
+    const emailRole = signedInUser.email?.endsWith("@students.labpilot.local")
+      ? "student"
+      : signedInUser.email?.endsWith("@faculty.labpilot.local")
+        ? "faculty"
+        : undefined;
+    const accountRole = profile?.role || signedInUser.user_metadata?.role || emailRole;
+    if (accountRole !== expectedRole) {
+      await supabase.auth.signOut();
+      return `This account is not registered as ${expectedRole}.`;
+    }
+    setUserRole(accountRole);
+    setUserDepartment(profile?.department || "");
+    setUser(signedInUser || null);
+    if (portal === "student") {
+      setSubmissionResult(null);
+      setEvaluationSubmitted(false);
+      setStudentEvaluation({ code: "", caseResults: [] });
+    }
     setMode(portal === "student" ? "student" : "faculty");
-    if (portal === "student") setStudentTab("evaluation");
+    if (portal === "faculty") setActive("faculty");
+    if (portal === "student") setStudentTab("dashboard");
     return "";
   };
   const signOut = async () => {
     if (supabase) await supabase.auth.signOut();
     setMode("landing");
   };
+
+  const handlePublishEvaluation = async (evaluation) => {
+    const normalized = {
+      name: evaluation.name?.trim() || "Untitled test",
+      question: evaluation.question?.trim() || "No problem statement provided.",
+      duration: Number(evaluation.duration) || 45,
+      testCases: Number(evaluation.testCases || evaluation.cases?.length || 0),
+      cases: Array.isArray(evaluation.cases) && evaluation.cases.length ? evaluation.cases : defaultCases,
+      status: "Published",
+      assignedLab: userRole === "admin" ? "All labs" : userLab,
+    };
+    const shouldActivate = true;
+    const localEvaluation = { ...normalized, isActive: shouldActivate };
+
+    if (!user || !["faculty", "admin"].includes(userRole)) {
+      return { ok: false, error: "Faculty or admin permission is required to publish tests." };
+    }
+    if (userRole === "faculty" && !userDepartment) {
+      return { ok: false, error: "Your faculty account is not assigned to a department." };
+    }
+    if (userRole === "faculty" && !userLab) {
+      return { ok: false, error: "Your faculty account is not assigned to a lab." };
+    }
+
+    setPublishedEvaluations((current) => {
+      const filtered = current.filter((item) => item.name !== normalized.name);
+      const next = [localEvaluation, ...filtered];
+      return shouldActivate
+        ? next.map((item) => ({ ...item, isActive: item.name === normalized.name }))
+        : next;
+    });
+    if (shouldActivate) setActiveEvaluation(localEvaluation);
+
+    if (!supabase || mode !== "faculty") return { ok: true, value: localEvaluation };
+
+    try {
+      const { data, error } = await supabase
+        .from("evaluations")
+        .upsert(
+          {
+            name: normalized.name,
+            department: userRole === "admin" ? "All departments" : userDepartment,
+            assigned_lab: userRole === "admin" ? "All labs" : userLab,
+            question: normalized.question,
+            duration: normalized.duration,
+            test_cases: normalized.testCases,
+            cases: normalized.cases,
+            status: normalized.status,
+            is_active: shouldActivate,
+            published_at: new Date().toISOString(),
+          },
+          { onConflict: "department,assigned_lab,name" },
+        )
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      if (shouldActivate) {
+        if (userRole === "faculty") {
+          await supabase
+            .from("evaluations")
+            .update({ is_active: false })
+            .eq("department", userDepartment)
+            .neq("name", normalized.name);
+        } else {
+          await supabase
+            .from("evaluations")
+            .update({ is_active: false })
+            .neq("name", normalized.name);
+        }
+      }
+
+      const savedEvaluation = {
+        name: data.name,
+        question: data.question,
+        duration: Number(data.duration) || 45,
+        testCases: Number(data.test_cases || data.cases?.length || 0),
+        cases: Array.isArray(data.cases) ? data.cases : defaultCases,
+        status: data.status || "Published",
+        isActive: shouldActivate,
+        assignedLab: data.assigned_lab || userLab,
+      };
+
+      setPublishedEvaluations((current) => {
+        const filtered = current.filter((item) => item.name !== savedEvaluation.name);
+        const next = [savedEvaluation, ...filtered];
+        return shouldActivate
+          ? next.map((item) => ({ ...item, isActive: item.name === savedEvaluation.name }))
+          : next;
+      });
+      if (shouldActivate) setActiveEvaluation(savedEvaluation);
+      return { ok: true, value: savedEvaluation };
+    } catch (error) {
+      console.error("Failed to save evaluation to Supabase", error);
+      return {
+        ok: false,
+        error:
+          error instanceof Error || typeof error?.message === "string"
+            ? error.message
+            : "Failed to save the test to Supabase.",
+      };
+    }
+  };
+
+  const handleSetActiveEvaluationByName = async (evaluationName) => {
+    if (!user || userRole !== "admin") {
+      return { ok: false, error: "Admin permission is required to set the active test." };
+    }
+
+    const next = publishedEvaluations.find((evaluation) => evaluation.name === evaluationName);
+    if (!next) return { ok: false, error: "The selected evaluation was not found." };
+
+    setActiveEvaluation({ ...next, isActive: true });
+    if (supabase && mode === "faculty") {
+      await supabase.from("evaluations").update({ is_active: false }).neq("name", evaluationName);
+      const { error } = await supabase
+        .from("evaluations")
+        .update({ is_active: true })
+        .eq("name", evaluationName);
+      if (error) {
+        console.error("Failed to set active evaluation", error);
+        return { ok: false, error: error.message };
+      }
+    }
+
+    setPublishedEvaluations((current) =>
+      current.map((evaluation) => ({
+        ...evaluation,
+        isActive: evaluation.name === evaluationName,
+      })),
+    );
+    return { ok: true };
+  };
+
+  const handleDeleteEvaluation = async (evaluationName) => {
+    if (!user || !["faculty", "admin"].includes(userRole)) {
+      return { ok: false, error: "Faculty or admin permission is required to delete tests." };
+    }
+
+    if (supabase && mode === "faculty") {
+      let deleteQuery = supabase
+        .from("evaluations")
+        .delete()
+        .eq("name", evaluationName);
+      if (userRole === "faculty") deleteQuery = deleteQuery.eq("department", userDepartment);
+      const { error } = await deleteQuery;
+      if (error) {
+        console.error("Failed to delete evaluation from Supabase", error);
+        return { ok: false, error: error.message };
+      }
+    }
+
+    setPublishedEvaluations((current) => {
+      const filtered = current.filter((item) => item.name !== evaluationName);
+      if (!filtered.length) return current;
+      const nextActive = filtered[0];
+      setActiveEvaluation(nextActive);
+      return filtered;
+    });
+
+    return { ok: true };
+  };
+
   const handleStudentSubmit = async (result) => {
+    setSubmissionError("");
+    const reportKey = studentProfile?.usn || user?.id || "current-student";
+    if (studentProfile?.usn) {
+      setAdminStudents((current) =>
+        current.map((student) =>
+          student[1] === studentProfile.usn
+            ? [...student.slice(0, 4), "Submitted"]
+            : student,
+        ),
+      );
+    }
+    setAiUsageReports((current) => ({
+      ...current,
+      [reportKey]: { status: "Analyzing", report: "" },
+    }));
+    const { data: authData } = supabase
+      ? await supabase.auth.getUser()
+      : { data: { user: null } };
+    const authenticatedUser = authData?.user;
+    if (!supabase || !authenticatedUser) {
+      setSubmissionError(
+        "Submission was not saved because the student account is not connected to Supabase.",
+      );
+      return;
+    }
+    const { data: savedSubmission, error: submissionInsertError } = await supabase
+      .from("submissions")
+      .insert({
+        student_id: authenticatedUser.id,
+        evaluation_name: activeEvaluation.name,
+        code: studentEvaluation.code,
+        case_results: studentEvaluation.caseResults,
+        score: result.score,
+        passed: result.passed,
+        total: result.total,
+        time_used: result.timeUsed,
+      })
+      .select("id")
+      .single();
+    if (submissionInsertError) {
+      console.error("Failed to save submission", submissionInsertError);
+      setSubmissionError(
+        `Submission was not saved: ${submissionInsertError.message}`,
+      );
+      return;
+    }
+
+    const submissionId = savedSubmission?.id;
+    const { data: previousSubmissions } = supabase && authenticatedUser
+      ? await supabase
+        .from("submissions")
+        .select("code")
+        .eq("student_id", authenticatedUser.id)
+        .eq("evaluation_name", activeEvaluation.name)
+        .neq("id", submissionId || "00000000-0000-0000-0000-000000000000")
+      : { data: [] };
+    const assessment = await assessSubmission({
+      source: studentEvaluation.code,
+      caseResults: studentEvaluation.caseResults,
+      compileErrors: studentEvaluation.caseResults.filter((item) => !item.matched),
+      priorSources: (previousSubmissions || []).map((submission) => submission.code),
+    });
+    setAiAssessment(assessment);
+    if (supabase && authenticatedUser && submissionId) {
+      const pipelineResults = await Promise.all([
+        supabase.from("coding_activity").insert({
+          student_id: authenticatedUser.id,
+          evaluation_name: activeEvaluation.name,
+          activity_type: "submit",
+          metadata: { score: result.score, passed: result.passed, total: result.total },
+        }),
+        supabase.from("execution_results").insert({
+          submission_id: submissionId,
+          passed: result.passed,
+          total: result.total,
+          case_results: studentEvaluation.caseResults,
+          duration_ms: (result.timeUsedSeconds || 0) * 1000,
+        }),
+        supabase.from("compilation_results").insert({
+          submission_id: submissionId,
+          success: result.passed === result.total,
+          errors: studentEvaluation.caseResults.filter((item) => !item.matched),
+          duration_ms: (result.timeUsedSeconds || 0) * 1000,
+        }),
+        supabase.from("evaluation_scores").insert({
+          submission_id: submissionId,
+          scores: { execution_success: result.score },
+          final_score: result.score,
+        }),
+        supabase.from("ai_assessments").insert({
+          submission_id: submissionId,
+          skill_score: assessment.skillScore,
+          debugging_score: assessment.debuggingScore,
+          code_quality_score: assessment.codeQualityScore,
+          plagiarism_score: assessment.plagiarismScore,
+          performance_prediction: assessment.performancePrediction,
+          strengths: assessment.strengths,
+          weaknesses: assessment.weaknesses,
+          feedback: assessment.feedback,
+        }),
+        supabase.from("reports").insert({
+          submission_id: submissionId,
+          report_type: "student",
+        }),
+      ]);
+      const pipelineErrors = pipelineResults.map((item) => item.error).filter(Boolean);
+      if (pipelineErrors.length) {
+        console.error("Some submission pipeline records were not saved", pipelineErrors);
+        setSubmissionError(
+          `Submission saved, but ${pipelineErrors.length} related database record(s) failed to save.`,
+        );
+      }
+    }
+
+    reviewAiUsage(studentEvaluation.code)
+      .then((report) => {
+        setAiUsageReports((current) => ({
+          ...current,
+          [reportKey]: { status: "Reviewed", report },
+        }));
+        if (supabase && authenticatedUser && submissionId) {
+          supabase.from("feedback").insert({
+            submission_id: submissionId,
+            author_id: authenticatedUser.id,
+            content: report,
+          });
+        }
+        if (studentProfile?.usn) {
+          setAdminStudents((current) =>
+            current.map((student) =>
+              student[1] === studentProfile.usn
+                ? [...student.slice(0, 4), "Reviewed"]
+                : student,
+            ),
+          );
+        }
+      })
+      .catch((error) => {
+        setAiUsageReports((current) => ({
+          ...current,
+          [reportKey]: {
+            status: "Unavailable",
+            report: error instanceof Error ? error.message : "AI usage review failed.",
+          },
+        }));
+        if (studentProfile?.usn) {
+          setAdminStudents((current) =>
+            current.map((student) =>
+              student[1] === studentProfile.usn
+                ? [...student.slice(0, 4), "Review unavailable"]
+                : student,
+            ),
+          );
+        }
+      });
     setSubmissionResult(result);
     setEvaluationSubmitted(true);
     setSubmissionsToday((count) => count + 1);
@@ -210,7 +1095,7 @@ function Dashboard() {
     setActivities((current) => [
       {
         initials: "AS",
-        name: "Aarav Shah",
+        name: studentProfile?.full_name || "Student",
         task: activeEvaluation.name,
         status: result.passed === result.total ? "Compiled" : "Review needed",
         tone: result.passed === result.total ? "green" : "red",
@@ -218,19 +1103,7 @@ function Dashboard() {
       },
       ...current,
     ]);
-    if (supabase && user)
-      await supabase
-        .from("submissions")
-        .insert({
-          student_id: user.id,
-          evaluation_name: activeEvaluation.name,
-          code: studentEvaluation.code,
-          case_results: studentEvaluation.caseResults,
-          score: result.score,
-          passed: result.passed,
-          total: result.total,
-          time_used: result.timeUsed,
-        });
+    return true;
   };
   const createStudent = async (student) => {
     if (!supabase) return "Supabase is not configured.";
@@ -243,9 +1116,77 @@ function Dashboard() {
     }
     setAdminStudents((current) => [
       ...current,
-      [student.name.trim(), student.usn.trim(), `${student.lab} · ${student.semester.trim()}`, "--", "In Progress"],
+      [student.name.trim(), student.usn.trim(), `${student.lab} · ${student.semester.trim()}`, "--", ""],
     ]);
     return data?.email ? "" : "Student account was not created.";
+  };
+  const deleteStudent = async (id) => {
+    if (!supabase) return { error: "Supabase is not configured." };
+    try {
+      const { data, error } = await supabase.functions.invoke("create-student", {
+        body: { action: "delete", id, role: "student" },
+      });
+      if (error) {
+        const serverMessage = error.context instanceof Response ? await error.context.text() : "";
+        return { error: serverMessage || error.message };
+      }
+      return { data };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "Student account deletion failed." };
+    }
+  };
+  const createFaculty = async (faculty) => {
+    if (!supabase) return "Supabase is not configured.";
+    const { data, error } = await supabase.functions.invoke("create-student", {
+      body: { ...faculty, role: "faculty" },
+    });
+    if (error) {
+      const serverMessage = error.context instanceof Response ? await error.context.text() : "";
+      return serverMessage || error.message;
+    }
+    if (!data?.id) return "Faculty account was not created.";
+    setFacultyMembers((current) => [
+      ...current,
+      {
+        id: data.id,
+        name: faculty.name.trim(),
+        usn: faculty.usn.trim(),
+        semester: faculty.semester.trim(),
+        department: faculty.department.trim(),
+        lab: faculty.lab,
+      },
+    ]);
+    return "";
+  };
+  const manageFaculty = async (action, faculty) => {
+    if (!supabase) return { error: "Supabase is not configured." };
+    try {
+      const { data, error } = await supabase.functions.invoke("create-student", {
+        body: { action, ...faculty, role: "faculty" },
+      });
+      if (error) {
+        const serverMessage = error.context instanceof Response ? await error.context.text() : "";
+        return { error: serverMessage || error.message };
+      }
+      if (action === "delete") {
+        setFacultyMembers((current) => current.filter((member) => member.id !== faculty.id));
+      } else {
+        setFacultyMembers((current) => current.map((member) => member.id === data.id ? { ...member, ...faculty } : member));
+      }
+      return { data };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "Faculty account action failed." };
+    }
+  };
+  const logCodingActivity = async (activityType, metadata = {}) => {
+    if (!supabase || !user || mode !== "student") return;
+    const { error } = await supabase.from("coding_activity").insert({
+      student_id: user.id,
+      evaluation_name: activeEvaluation.name,
+      activity_type: activityType,
+      metadata,
+    });
+    if (error) console.error("Failed to log coding activity", error);
   };
 
   if (mode === "landing")
@@ -253,6 +1194,7 @@ function Dashboard() {
       <Landing
         onStudent={() => setMode("login")}
         onAdmin={() => setMode("admin-login")}
+        onFaculty={() => setMode("faculty-login")}
       />
     );
   if (mode === "login")
@@ -269,25 +1211,31 @@ function Dashboard() {
         onBack={() => setMode("landing")}
       />
     );
+  if (mode === "faculty-login")
+    return (
+      <AdminLogin
+        faculty
+        onLogin={(username, password) => signIn("faculty", username, password)}
+        onBack={() => setMode("landing")}
+      />
+    );
 
   return (
     <div className="app-shell">
       {mode === "faculty" && (
-        <AdminSidebar
+          <AdminSidebar
           active={active}
           onNavigate={setActive}
           onLogout={signOut}
+            userRole={userRole}
         />
       )}
       {mode === "student" && (
         <StudentSidebar
           active={studentTab}
-          onNavigate={(tab) =>
-            setStudentTab(
-              evaluationSubmitted && tab === "evaluation" ? "results" : tab,
-            )
-          }
+          onNavigate={setStudentTab}
           profile={studentProfile}
+          evaluationSubmitted={evaluationSubmitted}
           onLogout={signOut}
         />
       )}
@@ -313,7 +1261,7 @@ function Dashboard() {
               </>
             ) : (
               <>
-                <span className="admin-role-label">Admin</span>
+                <span className="admin-role-label">{userRole === "admin" ? "Admin" : "Faculty"}</span>
                 <button className="icon-button" aria-label="Notifications">
                   ♧<span className="notification-dot" />
                 </button>
@@ -336,21 +1284,29 @@ function Dashboard() {
           <>
             {["dashboard", "evaluation"].includes(studentTab) ? (
               <StudentView
+                key={activeEvaluation.name}
                 studentTab={studentTab}
                 setStudentTab={setStudentTab}
                 activeEvaluation={activeEvaluation}
                 evaluationSubmitted={evaluationSubmitted}
                 submissionResult={submissionResult}
+                submissionError={submissionError}
                 setStudentEvaluation={setStudentEvaluation}
                 profile={studentProfile}
+                onActivity={logCodingActivity}
+                aiAssessment={aiAssessment}
                 onSubmit={handleStudentSubmit}
               />
             ) : (
               <StudentSection
                 section={studentTab}
                 activeEvaluation={activeEvaluation}
+                publishedEvaluations={publishedEvaluations}
                 submissionResult={submissionResult}
+                submissionError={submissionError}
                 studentEvaluation={studentEvaluation}
+                profile={studentProfile}
+                aiAssessment={aiAssessment}
                 evaluationStatus={
                   evaluationSubmitted ? "Completed" : "Not started"
                 }
@@ -363,11 +1319,27 @@ function Dashboard() {
             active={active}
             activeEvaluation={activeEvaluation}
             setActiveEvaluation={setActiveEvaluation}
+            userLab={userLab}
             onStudentCountChange={setActiveStudentCount}
-            activeEvaluations={activeEvaluations}
+            activeEvaluations={publishedEvaluations.length}
             students={adminStudents}
+            aiUsageReports={aiUsageReports}
+            activities={activities}
+            facultyRecords={facultyRecords}
+            submissionResult={submissionResult}
+            studentProfile={studentProfile}
             onStudentsChange={setAdminStudents}
             onCreateStudent={createStudent}
+            onDeleteStudent={deleteStudent}
+            facultyMembers={facultyMembers}
+            onCreateFaculty={createFaculty}
+            onManageFaculty={manageFaculty}
+            publishedEvaluations={publishedEvaluations}
+            setPublishedEvaluations={setPublishedEvaluations}
+            onPublishEvaluation={handlePublishEvaluation}
+            onDeleteEvaluation={handleDeleteEvaluation}
+            onSetActiveEvaluation={handleSetActiveEvaluationByName}
+            userRole={userRole}
           />
         )}
         <div
@@ -617,7 +1589,7 @@ function StatCard({ label, value, delta, detail, icon, tone, negative }) {
     </div>
   );
 }
-function Landing({ onStudent, onAdmin }) {
+function Landing({ onStudent, onAdmin, onFaculty }) {
   return (
     <div className="landing-shell">
       <div className="landing-content">
@@ -650,6 +1622,14 @@ function Landing({ onStudent, onAdmin }) {
                 Monitor activity, assess submissions, and manage laboratory
                 reports.
               </small>
+            </span>
+            <b>→</b>
+          </button>
+          <button className="role-card" onClick={onFaculty}>
+            <span className="role-card-icon admin-icon">◎</span>
+            <span>
+              <strong>Faculty portal</strong>
+              <small>Review class performance, submissions, and student feedback.</small>
             </span>
             <b>→</b>
           </button>
@@ -720,7 +1700,7 @@ function StudentLogin({ onLogin, onBack }) {
     </div>
   );
 }
-function AdminLogin({ onLogin, onBack }) {
+function AdminLogin({ onLogin, onBack, faculty = false }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -736,15 +1716,15 @@ function AdminLogin({ onLogin, onBack }) {
           <span>LabPilot</span>
         </div>
         <div className="login-icon admin-login-icon">▦</div>
-        <div className="eyebrow">ADMIN PORTAL</div>
-        <h1>Welcome back, faculty</h1>
+        <div className="eyebrow">{faculty ? "FACULTY PORTAL" : "ADMIN PORTAL"}</div>
+        <h1>{faculty ? "Welcome back, faculty" : "Welcome back, administrator"}</h1>
         <p>Sign in to monitor your laboratory and manage assessments.</p>
         <label htmlFor="admin-username">Username</label>
         <input
           id="admin-username"
           value={username}
           onChange={(event) => setUsername(event.target.value)}
-          placeholder="e.g. riya.mehta"
+          placeholder="Faculty ID, e.g. riya.mehta"
           autoComplete="username"
           required
         />
@@ -764,7 +1744,7 @@ function AdminLogin({ onLogin, onBack }) {
           type="submit"
           disabled={!username.trim() || !password}
         >
-          Sign in to admin portal <span className="button-arrow">→</span>
+          Sign in to {faculty ? "faculty" : "admin"} portal <span className="button-arrow">→</span>
         </button>
         <div className="login-options">
           <span>⌁</span> SSO and institutional login available
@@ -776,17 +1756,48 @@ function AdminLogin({ onLogin, onBack }) {
     </div>
   );
 }
-function AdminReportsView({ students, activeEvaluation }) {
+function AdminReportsView({ students, activeEvaluation, aiUsageReports, facultyRecords = [] }) {
   const downloadReport = (student) => {
+    const aiStatus = aiUsageReports?.[student[1]]?.status;
+    const aiReport = aiUsageReports?.[student[1]]?.report;
+    const record = facultyRecords.find(
+      (item) => item.profile?.usn === student[1] && item.evaluation_name === activeEvaluation.name,
+    ) || facultyRecords.find((item) => item.profile?.usn === student[1]) || student[6];
+    const savedAiFeedback = record?.assessment?.feedback || record?.feedback?.content;
+    const executionCases = record?.execution?.case_results || record?.case_results || [];
+    const executionLines = executionCases.length
+      ? executionCases.flatMap((testCase, index) => [
+          `Test ${index + 1}: ${testCase.input ?? "Input unavailable"}`,
+          `Expected: ${testCase.expected ?? "Expected output unavailable"}`,
+          `Actual: ${testCase.actual ?? "Output unavailable"}`,
+          `Result: ${testCase.matched ? "Passed" : "Failed"}`,
+          "",
+        ])
+      : [`Tests passed: ${record?.execution?.passed ?? record?.passed ?? student[3] ?? 0}/${record?.execution?.total ?? record?.total ?? "Not available"}`];
     const report = [
       `LabPilot Test Report`,
       `Student: ${student[0]}`,
       `USN: ${student[1]}`,
       `Assigned lab: ${student[2]}`,
+      `Department: ${student[5] || "Not available"}`,
       `Test: ${activeEvaluation.name}`,
+      "",
+      "Problem statement:",
+      activeEvaluation.question || "No problem statement provided.",
+      "",
       `Test cases: ${activeEvaluation.testCases}`,
-      `Status: ${student[4]}`,
+      `Status: ${student[4] || "Not started"}`,
       `Score: ${student[3]}`,
+      "",
+      "Submitted code:",
+      record?.code || "No code submitted.",
+      "",
+      "Test execution:",
+      ...executionLines,
+      "",
+      "AI feedback:",
+      savedAiFeedback || aiReport || "No AI feedback available.",
+      `AI usage status: ${aiStatus || (savedAiFeedback ? "Reviewed" : "Not available")}`,
     ].join("\n");
     const link = document.createElement("a");
     link.href = URL.createObjectURL(new Blob([report], { type: "text/plain" }));
@@ -846,7 +1857,7 @@ function AdminReportsView({ students, activeEvaluation }) {
                   {activeEvaluation.testCases} test cases
                 </small>
               </span>
-              <span className="status amber">{student[4]}</span>
+              <span className="status amber">{student[4] || "—"}</span>
               <button
                 className="row-action"
                 type="button"
@@ -873,10 +1884,26 @@ function FacultyModuleView({
   onStudentCountChange,
   activeEvaluations,
   students,
+  aiUsageReports,
+  activities,
+  facultyRecords,
+  submissionResult,
+  submissionError,
+  studentProfile,
   onStudentsChange,
   onCreateStudent,
+  facultyMembers,
+  onCreateFaculty,
+  onManageFaculty,
+  publishedEvaluations,
+  setPublishedEvaluations,
+  onPublishEvaluation,
+  onDeleteEvaluation,
+  onSetActiveEvaluation,
+  userRole,
+  userLab,
 }) {
-  if (active === "monitoring") return <MonitoringView />;
+  if (active === "monitoring") return <MonitoringView activities={activities} />;
   if (active === "students")
     return (
       <StudentManagementViewEditable
@@ -888,19 +1915,40 @@ function FacultyModuleView({
       />
     );
   if (active === "labs")
-    return <TestBuilderView setActiveEvaluation={setActiveEvaluation} />;
-  if (active === "faculty") return <FacultyDirectoryViewEditable />;
+    return (
+      <LabManagementView
+        setActiveEvaluation={setActiveEvaluation}
+        publishedEvaluations={publishedEvaluations}
+        setPublishedEvaluations={setPublishedEvaluations}
+        onPublishEvaluation={onPublishEvaluation}
+        onDeleteEvaluation={onDeleteEvaluation}
+        onSetActiveEvaluation={onSetActiveEvaluation}
+        userRole={userRole}
+        userLab={userLab}
+      />
+    );
+  if (active === "faculty") return <FacultyDashboardView records={facultyRecords} facultyMembers={facultyMembers} onCreateFaculty={onCreateFaculty} onManageFaculty={onManageFaculty} userRole={userRole} />;
   if (active === "execution") return <ExecutionEvaluationView />;
   if (active === "storage") return <StorageView />;
   if (active === "scoring") return <ScoringView />;
   if (active === "rubric") return <RubricView />;
-  if (active === "assessment") return <AssessmentView />;
-  if (active === "analytics") return <PlagiarismView />;
+  if (active === "assessment")
+    return (
+      <AssessmentView
+        activeEvaluation={activeEvaluation}
+        submissionResult={submissionResult}
+        studentProfile={studentProfile}
+        facultyRecords={facultyRecords}
+      />
+    );
+  if (active === "analytics") return <AnalyticsView />;
   if (active === "reports")
     return (
       <AdminReportsView
         students={students}
         activeEvaluation={activeEvaluation}
+        aiUsageReports={aiUsageReports}
+        facultyRecords={facultyRecords}
       />
     );
   const content = {
@@ -1146,6 +2194,110 @@ function FacultyDirectoryViewEditable() {
   );
 }
 
+function FacultyDashboardView({ records = [], facultyMembers = [], onCreateFaculty, onManageFaculty, userRole }) {
+  const [selectedId, setSelectedId] = useState(records[0]?.student_id || "");
+  const [showFacultyForm, setShowFacultyForm] = useState(false);
+  const [editingFaculty, setEditingFaculty] = useState(null);
+  const [facultyForm, setFacultyForm] = useState({ name: "", usn: "", department: "", semester: "Faculty", lab: "", password: "" });
+  const [facultyError, setFacultyError] = useState("");
+  const [facultySuccess, setFacultySuccess] = useState("");
+  const [creatingFaculty, setCreatingFaculty] = useState(false);
+  const [managingFaculty, setManagingFaculty] = useState(false);
+  const selected = records.find((record) => record.student_id === selectedId) || records[0];
+  const completed = records.length;
+  const averageScore = records.length
+    ? Math.round(records.reduce((sum, record) => sum + Number(record.score || 0), 0) / records.length)
+    : 0;
+  const needingAttention = records.filter((record) => Number(record.passed || 0) < Number(record.total || 0)).length;
+  const passRate = records.length
+    ? Math.round(records.reduce((sum, record) => sum + (Number(record.passed || 0) === Number(record.total || 0) ? 1 : 0), 0) / records.length * 100)
+    : 0;
+
+  return (
+    <div className="module-view management-view">
+      <div className="module-view-heading">
+        <div>
+          <div className="eyebrow">FACULTY DASHBOARD</div>
+          <h1>Class performance</h1>
+          <p>Live performance, evaluation results, and student-level evidence from Supabase.</p>
+        </div>
+        {userRole === "admin" && <button className="primary-button" type="button" onClick={() => { setEditingFaculty(null); setShowFacultyForm((visible) => !visible); setFacultyError(""); setFacultySuccess(""); }}>＋ Add faculty</button>}
+      </div>
+      {userRole === "admin" && showFacultyForm && (
+        <form className="panel student-add-form" onSubmit={async (event) => {
+          event.preventDefault();
+          setFacultyError("");
+          setFacultySuccess("");
+          if (!onCreateFaculty && !editingFaculty) {
+            setFacultyError("Faculty account creation is not available in this session.");
+            return;
+          }
+          setCreatingFaculty(true);
+          const result = editingFaculty
+            ? await onManageFaculty("update", { ...facultyForm, id: editingFaculty.id })
+            : { error: await onCreateFaculty(facultyForm) };
+          setCreatingFaculty(false);
+          if (result.error) setFacultyError(result.error);
+          else {
+            setFacultyForm({ name: "", usn: "", department: "", semester: "Faculty", lab: "", password: "" });
+            setEditingFaculty(null);
+            setShowFacultyForm(false);
+            setFacultySuccess(editingFaculty ? "Faculty account updated." : "Faculty account created. They can now sign in through the Faculty portal.");
+          }
+        }}>
+          <div className="panel-heading"><div><h2>{editingFaculty ? "Edit faculty account" : "Create faculty account"}</h2><p>Faculty can sign in through the separate Faculty portal.</p></div></div>
+          <div className="builder-fields">
+            <label>Full name<input placeholder="e.g. Dr. Riya Mehta" value={facultyForm.name} onChange={(event) => setFacultyForm({ ...facultyForm, name: event.target.value })} required /></label>
+            <label>Faculty ID<input placeholder="e.g. riya.mehta" value={facultyForm.usn} onChange={(event) => setFacultyForm({ ...facultyForm, usn: event.target.value })} required /></label>
+            <label>Department<select value={facultyForm.department} onChange={(event) => setFacultyForm({ ...facultyForm, department: event.target.value })} required><option value="">Select department</option><option value="CSE">CSE</option><option value="ISE">ISE</option><option value="AIML">AIML</option></select></label>
+            <label>Assigned lab<select value={facultyForm.lab} onChange={(event) => setFacultyForm({ ...facultyForm, lab: event.target.value })} required><option value="">Select assigned lab</option><option value="Data Structures">Data Structures</option><option value="Programming Fundamentals">Programming Fundamentals</option><option value="Object Oriented Programming">Object Oriented Programming</option></select></label>
+            <label>Temporary password<input type="password" placeholder={editingFaculty ? "Leave blank to keep current" : "At least 6 characters"} minLength="6" value={facultyForm.password} onChange={(event) => setFacultyForm({ ...facultyForm, password: event.target.value })} required={!editingFaculty} /></label>
+          </div>
+          {facultyError && <div className="login-error">{facultyError}</div>}
+          {facultySuccess && <div className="notice"><span>✓</span>{facultySuccess}</div>}
+          <button className="review-button" type="submit" disabled={creatingFaculty}>{creatingFaculty ? "Saving account..." : editingFaculty ? "Save faculty changes" : "Create faculty account"} <span>→</span></button>
+          {editingFaculty && <button className="row-action" type="button" onClick={() => { setEditingFaculty(null); setShowFacultyForm(false); }}>Cancel edit</button>}
+        </form>
+      )}
+      {!showFacultyForm && (facultyError || facultySuccess) && (
+        <div className={facultyError ? "login-error" : "notice"}>
+          {facultyError || facultySuccess}
+          <button type="button" onClick={() => { setFacultyError(""); setFacultySuccess(""); }}>×</button>
+        </div>
+      )}
+      {userRole === "admin" && facultyMembers.length > 0 && <div className="panel management-table"><div className="panel-heading"><div><h2>Faculty accounts</h2><p>Accounts created by the administrator</p></div></div>{facultyMembers.map((faculty) => <div className="directory-row" key={faculty.id || faculty.usn}><span><strong>{faculty.name}</strong><small>{faculty.usn}</small></span><span>{faculty.department || "Department not set"}</span><span>{faculty.lab || "Assigned lab not set"}</span><span className="status green">Faculty</span><span className="student-row-actions"><button className="row-action" type="button" onClick={() => { setEditingFaculty(faculty); setFacultyForm({ name: faculty.name || "", usn: faculty.usn || "", department: faculty.department || "", semester: faculty.semester || "Faculty", lab: faculty.lab || "", password: "" }); setShowFacultyForm(true); setFacultyError(""); setFacultySuccess(""); }}>Edit</button><button className="row-action delete-action" type="button" disabled={managingFaculty} onClick={async () => { if (!window.confirm(`Delete faculty account for ${faculty.name}?`)) return; setManagingFaculty(true); const result = await onManageFaculty("delete", { id: faculty.id }); setManagingFaculty(false); if (result.error) setFacultyError(result.error); else setFacultySuccess("Faculty account deleted."); }}>Delete</button></span></div>)}</div>}
+      <div className="management-stats">
+        <StatCard label="Completed experiments" value={completed} delta="" detail="submitted evaluations" icon="✓" tone="yellow" />
+        <StatCard label="Average class score" value={`${averageScore}%`} delta="" detail={`${passRate}% fully passed`} icon="✦" tone="mint" />
+        <StatCard label="Needs attention" value={needingAttention} delta="" detail="failed test cases" icon="!" tone="coral" negative />
+      </div>
+      <section className="content-grid">
+        <div className="panel management-table">
+          <div className="panel-heading">
+            <div><h2>Student performance</h2><p>Select a student to inspect the evaluation pipeline.</p></div>
+            <span className="status green">{records.length} records</span>
+          </div>
+          {records.length ? records.map((record) => (
+            <button className={`directory-row ${selected?.student_id === record.student_id ? "selected" : ""}`} type="button" key={record.student_id} onClick={() => setSelectedId(record.student_id)}>
+              <span className="directory-person"><span className="avatar directory-avatar">{record.profile?.full_name?.split(" ").map((part) => part[0]).join("").slice(0, 2) || "ST"}</span><span><strong>{record.profile?.full_name || "Student"}</strong><small>{record.profile?.usn || record.student_id}</small></span></span>
+              <span>{record.evaluation_name}</span>
+              <strong className="directory-score">{record.score}%</strong>
+              <span className={`status ${Number(record.passed) === Number(record.total) ? "green" : "amber"}`}>{Number(record.passed) === Number(record.total) ? "Passed" : "Review"}</span>
+            </button>
+          )) : <div className="activity-empty">No submitted evaluations yet.</div>}
+        </div>
+        <div className="panel session-detail">
+          <div className="panel-heading"><div><h2>{selected?.profile?.full_name || "No student selected"}</h2><p>{selected?.evaluation_name || "Student pipeline details"}</p></div><span className="status green">{selected ? `${selected.score}%` : "--"}</span></div>
+          {selected ? <>
+            <div className="detail-meta"><span><b>⌁</b> {selected.activities.length} activity events</span><span><b>↗</b> {selected.compilation?.success ? "Compilation passed" : "Compilation record unavailable"}</span><span><b>◷</b> {selected.execution ? `${selected.execution.passed}/${selected.execution.total} tests` : "Execution unavailable"}</span></div>
+            <div className="detail-timeline"><strong>Evaluation evidence</strong><span><i className="timeline-dot green" />AI skill: {selected.assessment?.skill_score ?? "Not assessed"} · Debugging: {selected.assessment?.debugging_score ?? "Not assessed"}</span><span><i className="timeline-dot amber" />Code quality: {selected.assessment?.code_quality_score ?? "Not assessed"} · Similarity: {selected.assessment?.plagiarism_score ?? "Not assessed"}%</span><span><i className="timeline-dot green" />Feedback: {selected.feedback?.content || selected.assessment?.feedback || "No feedback recorded"}</span></div>
+          </> : <div className="activity-empty">Submit an evaluation to populate student details.</div>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function FacultyDirectoryView() {
   return (
     <div className="module-view management-view">
@@ -1206,14 +2358,31 @@ function FacultyDirectoryView() {
     </div>
   );
 }
-function TestBuilderView({ setActiveEvaluation }) {
-  const [name, setName] = useState("Sorting Algorithm");
-  const [question, setQuestion] = useState(
-    "Implement an efficient sorting algorithm and explain its time complexity.",
+function TestBuilderView({
+  setActiveEvaluation,
+  publishedEvaluations,
+  setPublishedEvaluations,
+}) {
+  const [name, setName] = useState(
+    publishedEvaluations?.[0]?.name || "Sorting Algorithm",
   );
-  const [duration, setDuration] = useState(45);
-  const [cases, setCases] = useState(defaultCases);
+  const [question, setQuestion] = useState(
+    publishedEvaluations?.[0]?.question ||
+      "Implement an efficient sorting algorithm and explain its time complexity.",
+  );
+  const [duration, setDuration] = useState(publishedEvaluations?.[0]?.duration || 45);
+  const [cases, setCases] = useState(publishedEvaluations?.[0]?.cases || defaultCases);
   const [published, setPublished] = useState(false);
+
+  const loadEvaluation = (evaluation) => {
+    setName(evaluation.name);
+    setQuestion(evaluation.question);
+    setDuration(evaluation.duration);
+    setCases(evaluation.cases || defaultCases);
+    setPublished(true);
+    setActiveEvaluation(evaluation);
+  };
+
   const updateCase = (index, column, value) =>
     setCases(
       cases.map((item, itemIndex) =>
@@ -1222,17 +2391,28 @@ function TestBuilderView({ setActiveEvaluation }) {
           : item,
       ),
     );
+
   const publish = () => {
-    setActiveEvaluation({
-      name,
-      question,
+    const normalizedName = name.trim() || "Untitled test";
+    const normalizedQuestion = question.trim() || "No problem statement provided.";
+    const nextEvaluation = {
+      name: normalizedName,
+      question: normalizedQuestion,
       duration,
       testCases: cases.length,
       cases,
       status: "Published",
+    };
+    setPublishedEvaluations((current) => {
+      const filtered = current.filter(
+        (evaluation) => evaluation.name !== normalizedName,
+      );
+      return [nextEvaluation, ...filtered];
     });
+    setActiveEvaluation(nextEvaluation);
     setPublished(true);
   };
+
   return (
     <div className="module-view management-view">
       <div className="module-view-heading">
@@ -1320,6 +2500,31 @@ function TestBuilderView({ setActiveEvaluation }) {
           <span>→</span>
         </button>
       </div>
+      {publishedEvaluations?.length > 0 && (
+        <div className="panel publish-preview">
+          <div className="panel-heading">
+            <div>
+              <h2>Published tests</h2>
+              <p>Switch between evaluations already published to students.</p>
+            </div>
+          </div>
+          <div className="published-test-list">
+            {publishedEvaluations.map((evaluation) => (
+              <button
+                key={`${evaluation.name}-${evaluation.duration}`}
+                type="button"
+                className="published-test-item"
+                onClick={() => loadEvaluation(evaluation)}
+              >
+                <strong>{evaluation.name}</strong>
+                <small>
+                  {evaluation.duration} min · {evaluation.testCases || evaluation.cases?.length || 0} cases
+                </small>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       {published && (
         <div className="notice">
           <span>✓</span> Test published with ten input/output checks and is
@@ -1491,6 +2696,7 @@ function StudentManagementView() {
   const [studentForm, setStudentForm] = useState({
     name: "",
     usn: "",
+    department: "Computer Science",
     semester: "",
     lab: "Data Structures",
     password: "",
@@ -1603,32 +2809,32 @@ function StudentManagementView() {
         <StatCard
           label="Total students"
           value={students.length}
-          delta="+14"
-          detail="this semester"
+          delta=""
+          detail="in database"
           icon="◉"
           tone="mint"
         />
         <StatCard
           label="Active evaluations"
-          value="32"
-          delta="+8.4%"
-          detail="this week"
+          value={activeEvaluations}
+          delta=""
+          detail="published tests"
           icon="▷"
           tone="blue"
         />
         <StatCard
           label="Completed"
-          value="186"
-          delta="75%"
-          detail="of total"
+          value={students.filter((student) => student[4] === "Submitted").length}
+          delta=""
+          detail="submitted reports"
           icon="✓"
           tone="yellow"
         />
         <StatCard
           label="Needs attention"
-          value="12"
-          delta="-3"
-          detail="this week"
+          value={students.filter((student) => student[4] === "Review needed").length}
+          delta=""
+          detail="review-needed reports"
           icon="!"
           tone="coral"
           negative
@@ -1801,6 +3007,7 @@ function StudentManagementViewEditable({
   students,
   onStudentsChange,
   onCreateStudent,
+  onDeleteStudent,
 }) {
   const [query, setQuery] = useState("");
   const [showForm, setShowForm] = useState(false);
@@ -1823,6 +3030,7 @@ function StudentManagementViewEditable({
     setStudentForm({
       name: "",
       usn: "",
+      department: "Computer Science",
       semester: "",
       lab: "Data Structures",
       password: "",
@@ -1837,6 +3045,7 @@ function StudentManagementViewEditable({
     setStudentForm({
       name,
       usn,
+      department: student[5] || "Computer Science",
       semester: semester || "Not specified",
       lab,
       password: "",
@@ -1866,6 +3075,7 @@ function StudentManagementViewEditable({
       `${studentForm.lab} · ${studentForm.semester.trim()}`,
       "--",
       "In Progress",
+      studentForm.department.trim(),
     ];
     onStudentsChange(
       editingUsn
@@ -1878,6 +3088,7 @@ function StudentManagementViewEditable({
     setStudentForm({
       name: "",
       usn: "",
+      department: "Computer Science",
       semester: "",
       lab: "Data Structures",
       password: "",
@@ -1886,8 +3097,15 @@ function StudentManagementViewEditable({
     setShowForm(false);
     setFormError("");
   };
-  const deleteStudent = (usn) => {
-    onStudentsChange(students.filter((student) => student[1] !== usn));
+  const deleteStudent = async (student) => {
+    if (!onDeleteStudent || !student[7]) return;
+    if (!window.confirm(`Delete student account for ${student[0]}?`)) return;
+    const result = await onDeleteStudent(student[7]);
+    if (result.error) {
+      setFormError(result.error);
+      return;
+    }
+    onStudentsChange(students.filter((current) => current[1] !== student[1]));
     onStudentCountChange((count) => Math.max(0, count - 1));
   };
   const passwordField = (
@@ -1957,8 +3175,22 @@ function StudentManagementViewEditable({
               />
             </label>
             <label>
+              Department
+              <select
+                value={studentForm.department}
+                onChange={(event) =>
+                  setStudentForm({ ...studentForm, department: event.target.value })
+                }
+                required
+              >
+                <option value="CSE">CSE</option>
+                <option value="ISE">ISE</option>
+                <option value="AIML">AIML</option>
+              </select>
+            </label>
+            <label>
               Semester
-              <input
+              <select
                 value={studentForm.semester}
                 onChange={(event) =>
                   setStudentForm({
@@ -1967,7 +3199,13 @@ function StudentManagementViewEditable({
                   })
                 }
                 required
-              />
+              >
+                <option value="">Select semester</option>
+                {Array.from({ length: 8 }, (_, index) => {
+                  const semester = `${index + 1}${index === 0 ? "st" : index === 1 ? "nd" : index === 2 ? "rd" : "th"}`;
+                  return <option key={semester} value={semester}>{semester}</option>;
+                })}
+              </select>
             </label>
             <label>
               Assigned lab
@@ -2088,7 +3326,7 @@ function StudentManagementViewEditable({
               <button
                 className="row-action delete-action"
                 type="button"
-                onClick={() => deleteStudent(student[1])}
+                onClick={() => deleteStudent(student)}
               >
                 Delete
               </button>
@@ -2100,25 +3338,115 @@ function StudentManagementViewEditable({
   );
 }
 
-function LabManagementView() {
+function LabManagementView({
+  setActiveEvaluation,
+  publishedEvaluations,
+  setPublishedEvaluations,
+  onPublishEvaluation,
+  onDeleteEvaluation,
+  onSetActiveEvaluation,
+  userRole,
+  userLab,
+}) {
   const [created, setCreated] = useState(false);
-  const labs = [
-    ["CS301", "Data Structures", "05 experiments", "128 students", "Active"],
-    [
-      "CS205",
-      "Object Oriented Programming",
-      "08 experiments",
-      "96 students",
-      "Active",
+  const [publishError, setPublishError] = useState("");
+  const [selectedPublishedName, setSelectedPublishedName] = useState(
+    publishedEvaluations?.[0]?.name || "Sorting Algorithm",
+  );
+  const [name, setName] = useState(
+    publishedEvaluations?.[0]?.name || "Sorting Algorithm",
+  );
+  const [question, setQuestion] = useState(
+    publishedEvaluations?.[0]?.question ||
+      "Implement an efficient sorting algorithm and explain its time complexity.",
+  );
+  const [duration, setDuration] = useState(publishedEvaluations?.[0]?.duration || 45);
+  const [cases, setCases] = useState(publishedEvaluations?.[0]?.cases || defaultCases);
+
+  useEffect(() => {
+    if (!publishedEvaluations?.length) return;
+    const activePublished = publishedEvaluations.find((evaluation) => evaluation.isActive);
+    const selected = publishedEvaluations.find(
+      (evaluation) => evaluation.name === selectedPublishedName,
+    );
+    const next = activePublished || selected || publishedEvaluations[0];
+    if (next && next.name !== selectedPublishedName) applyEvaluation(next);
+  }, [publishedEvaluations, selectedPublishedName]);
+
+  const labs = (publishedEvaluations?.length ? publishedEvaluations : [defaultEvaluation]).map(
+    (evaluation, index) => [
+      `LAB-${String(index + 1).padStart(2, "0")}`,
+      evaluation.name,
+      `${evaluation.cases?.length || evaluation.testCases || 0} test cases`,
+      `${evaluation.duration || 45} minutes`,
+      evaluation.isActive ? "Active" : "Published",
     ],
-    [
-      "CS110",
-      "Programming Fundamentals",
-      "06 experiments",
-      "112 students",
-      "Draft",
-    ],
-  ];
+  );
+
+  const updateCase = (index, column, value) =>
+    setCases(
+      cases.map((item, itemIndex) =>
+        itemIndex === index
+          ? item.map((cell, cellIndex) => (cellIndex === column ? value : cell))
+          : item,
+      ),
+    );
+
+  const applyEvaluation = (evaluation) => {
+    setName(evaluation.name);
+    setQuestion(evaluation.question);
+    setDuration(evaluation.duration);
+    setCases(evaluation.cases || defaultCases);
+    setSelectedPublishedName(evaluation.name);
+    setActiveEvaluation(evaluation);
+  };
+
+  const publish = async () => {
+    const normalizedName = name.trim() || "Untitled test";
+    const normalizedQuestion = question.trim() || "No problem statement provided.";
+    const nextEvaluation = {
+      name: normalizedName,
+      question: normalizedQuestion,
+      duration,
+      testCases: cases.length,
+      cases,
+      status: "Published",
+      assignedLab: userRole === "admin" ? "All labs" : userLab,
+    };
+    setPublishError("");
+    if (onPublishEvaluation) {
+      const result = await onPublishEvaluation(nextEvaluation);
+      if (result && result.ok === false) {
+        setPublishError(result.error || "Admin permission is required.");
+        return;
+      }
+    } else {
+      setPublishedEvaluations((current) => {
+        const filtered = current.filter(
+          (evaluation) => evaluation.name !== normalizedName,
+        );
+        return [nextEvaluation, ...filtered];
+      });
+      setActiveEvaluation(nextEvaluation);
+    }
+    setSelectedPublishedName(normalizedName);
+    setCreated(true);
+  };
+
+  const deleteEvaluation = async (evaluationName) => {
+    if (!onDeleteEvaluation) return;
+    const result = await onDeleteEvaluation(evaluationName);
+    if (result?.ok === false) {
+      setPublishError(result.error || "Unable to delete the selected test.");
+      return;
+    }
+    setPublishError("");
+    if (selectedPublishedName === evaluationName) {
+      const remaining = (publishedEvaluations || []).filter((item) => item.name !== evaluationName);
+      if (remaining[0]) applyEvaluation(remaining[0]);
+    }
+  };
+
   return (
     <div className="module-view management-view">
       <div className="module-view-heading">
@@ -2130,8 +3458,8 @@ function LabManagementView() {
             cases, and evaluation durations from one place.
           </p>
         </div>
-        <button className="primary-button" onClick={() => setCreated(true)}>
-          ＋ Create lab <span className="button-arrow">→</span>
+        <button className="primary-button" onClick={publish} disabled={!['faculty', 'admin'].includes(userRole)}>
+          ＋ Publish test <span className="button-arrow">→</span>
         </button>
       </div>
       <div className="lab-management-grid">
@@ -2141,7 +3469,7 @@ function LabManagementView() {
               <h2>Laboratories</h2>
               <p>Active courses and experiment sets</p>
             </div>
-            <span className="status green">3 labs</span>
+            <span className="status green">{labs.length} labs</span>
           </div>
           {labs.map((lab) => (
             <div className="lab-row" key={lab[0]}>
@@ -2169,27 +3497,101 @@ function LabManagementView() {
             </div>
             <span className="edit-icon">✎</span>
           </div>
+          {!['faculty', 'admin'].includes(userRole) && (
+            <div className="notice" style={{ marginBottom: "16px" }}>
+              <span>!</span> Faculty or admin permission is required to publish tests.
+            </div>
+          )}
+          {publishError && (
+            <div className="notice" style={{ marginBottom: "16px", background: "#fff1f1", color: "#8a1c1c" }}>
+              <span>!</span> {publishError}
+            </div>
+          )}
+          <label>
+            Active published test
+            <select
+              value={selectedPublishedName}
+              onChange={async (event) => {
+                const match = (publishedEvaluations || []).find(
+                  (evaluation) => evaluation.name === event.target.value,
+                );
+                if (!match) return;
+                if (onSetActiveEvaluation) {
+                  const result = await onSetActiveEvaluation(match.name);
+                  if (result?.ok === false) {
+                    setPublishError(result.error || "Unable to set the active test.");
+                    return;
+                  }
+                }
+                applyEvaluation(match);
+              }}
+            >
+              {(publishedEvaluations || []).map((evaluation) => (
+                <option key={evaluation.name} value={evaluation.name}>
+                  {evaluation.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <label>
             Experiment name
-            <input defaultValue="Sorting Algorithm" />
+            <input value={name} onChange={(event) => setName(event.target.value)} />
           </label>
           <label>
             Problem statement
-            <textarea defaultValue="Implement an efficient sorting algorithm and explain its complexity." />
+            <textarea value={question} onChange={(event) => setQuestion(event.target.value)} />
           </label>
           <div className="builder-fields">
             <label>
               Duration
-              <select defaultValue="45">
+              <select
+                value={duration}
+                onChange={(event) => setDuration(Number(event.target.value))}
+              >
                 <option value="30">30 minutes</option>
                 <option value="45">45 minutes</option>
                 <option value="60">60 minutes</option>
+                <option value="90">90 minutes</option>
               </select>
             </label>
             <label>
               Test cases
-              <input type="number" defaultValue="10" />
+              <input
+                type="number"
+                min="1"
+                value={cases.length}
+                onChange={(event) => {
+                  const nextCount = Number(event.target.value) || 1;
+                  const nextCases = Array.from({ length: nextCount }, (_, index) => {
+                    const current = cases[index] || ["", ""];
+                    return [current[0] || "", current[1] || ""];
+                  });
+                  setCases(nextCases);
+                }}
+              />
             </label>
+          </div>
+          <div className="test-case-editor">
+            <div className="case-head">
+              <span>#</span>
+              <span>INPUT</span>
+              <span>EXPECTED OUTPUT</span>
+            </div>
+            {cases.map((item, index) => (
+              <div className="case-row" key={index}>
+                <b>{index + 1}</b>
+                <input
+                  value={item[0]}
+                  onChange={(event) => updateCase(index, 0, event.target.value)}
+                  aria-label={`Test ${index + 1} input`}
+                />
+                <input
+                  value={item[1]}
+                  onChange={(event) => updateCase(index, 1, event.target.value)}
+                  aria-label={`Test ${index + 1} expected output`}
+                />
+              </div>
+            ))}
           </div>
           <div className="builder-checks">
             <label>
@@ -2199,11 +3601,54 @@ function LabManagementView() {
               <input type="checkbox" defaultChecked /> Enable AI feedback
             </label>
           </div>
-          <button className="review-button" onClick={() => setCreated(true)}>
+          <button className="review-button" onClick={publish} disabled={!['faculty', 'admin'].includes(userRole)}>
             Save experiment <span>→</span>
           </button>
         </div>
       </div>
+      {publishedEvaluations?.length > 0 && (
+        <div className="panel publish-preview">
+          <div className="panel-heading">
+            <div>
+              <h2>Published tests</h2>
+              <p>Switch between evaluations already published to students.</p>
+            </div>
+          </div>
+          <div className="published-test-list">
+            {publishedEvaluations.map((evaluation) => (
+              <div key={`${evaluation.name}-${evaluation.duration}`} className="published-test-item">
+                <button
+                  type="button"
+                  className="published-test-item-button"
+                  onClick={async () => {
+                    if (onSetActiveEvaluation) {
+                      const result = await onSetActiveEvaluation(evaluation.name);
+                      if (result?.ok === false) {
+                        setPublishError(result.error || "Unable to set the active test.");
+                        return;
+                      }
+                    }
+                    applyEvaluation(evaluation);
+                  }}
+                >
+                  <strong>{evaluation.name}</strong>
+                  <small>
+                    {evaluation.duration} min · {evaluation.testCases || evaluation.cases?.length || 0} cases
+                  </small>
+                </button>
+                <button
+                  type="button"
+                  className="row-action danger-action"
+                  onClick={() => deleteEvaluation(evaluation.name)}
+                  disabled={!['faculty', 'admin'].includes(userRole)}
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {created && (
         <div className="notice">
           <span>✓</span> Lab configuration saved successfully.
@@ -2239,6 +3684,9 @@ function calculateSimilarity(firstSource, secondSource) {
 function PlagiarismView() {
   const [firstSource, setFirstSource] = useState("");
   const [secondSource, setSecondSource] = useState("");
+  const [aiReview, setAiReview] = useState("");
+  const [aiReviewLoading, setAiReviewLoading] = useState(false);
+  const [aiReviewError, setAiReviewError] = useState("");
   const similarity = calculateSimilarity(firstSource, secondSource);
   const hasComparison = Boolean(firstSource.trim() && secondSource.trim());
   const verdict =
@@ -2247,15 +3695,57 @@ function PlagiarismView() {
       : similarity >= 40
         ? "Possible overlap"
         : "Low similarity";
+  const requestOriginalityReview = async () => {
+    if (!hasComparison) return;
+    setAiReviewLoading(true);
+    setAiReviewError("");
+    const prompt = [
+      "Review two student code submissions for possible copying.",
+      "Use the similarity score and the code evidence only. Do not claim certainty or accuse a student.",
+      "Return exactly these sections: Verdict, Evidence, Recommendation.",
+      `Token similarity score: ${similarity}%`,
+      "Submission A:",
+      firstSource,
+      "Submission B:",
+      secondSource,
+    ].join("\n\n");
+    try {
+      const response = await fetch(
+        import.meta.env.VITE_OLLAMA_URL || "http://localhost:11434/api/generate",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: import.meta.env.VITE_OLLAMA_MODEL || "llama3.2",
+            prompt,
+            stream: false,
+          }),
+        },
+      );
+      const data = await response.json();
+      if (!response.ok || data.error) {
+        throw new Error(data.error || "AI originality review failed.");
+      }
+      setAiReview(data.response?.trim() || "No originality review was returned.");
+    } catch (error) {
+      setAiReviewError(
+        error instanceof Error
+          ? `${error.message} Start Ollama with: ollama run llama3.2`
+          : "AI originality review failed.",
+      );
+    } finally {
+      setAiReviewLoading(false);
+    }
+  };
   return (
     <div className="module-view plagiarism-view">
       <div className="module-view-heading">
         <div>
           <div className="eyebrow">AI ANALYTICS · ORIGINALITY</div>
-          <h1>Compare submissions</h1>
+          <h1>Originality check</h1>
           <p>
-            Compare two student submissions after comments and formatting are
-            normalized.
+            Analyze student code for possible copied patterns after comments and
+            formatting are normalized.
           </p>
         </div>
         <span
@@ -2310,6 +3800,29 @@ function PlagiarismView() {
           </i>
           <span>70% review threshold</span>
         </div>
+      </div>
+      <div className="panel originality-review">
+        <div className="panel-heading">
+          <div>
+            <h2>AI originality review</h2>
+            <p>Use this as a review signal, not proof of misconduct.</p>
+          </div>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={requestOriginalityReview}
+            disabled={!hasComparison || aiReviewLoading}
+          >
+            {aiReviewLoading ? "Reviewing..." : "Review with AI"}
+          </button>
+        </div>
+        {aiReviewError ? (
+          <p className="originality-error">{aiReviewError}</p>
+        ) : (
+          <pre className="ai-originality-result">
+            {aiReview || "Enter both submissions, then run an AI originality review."}
+          </pre>
+        )}
       </div>
     </div>
   );
@@ -2405,17 +3918,46 @@ function AnalyticsView() {
   );
 }
 
-function AssessmentView() {
-  const [selected, setSelected] = useState("Aarav Shah");
+function AssessmentView({ activeEvaluation, submissionResult, studentProfile, facultyRecords = [] }) {
+  const [selected, setSelected] = useState("");
   const [running, setRunning] = useState(false);
-  const assessments = [
-    ["Maya Patel", "File I/O & Exceptions", "89", "98%", "Scored", "green"],
-    ["Rohan Kumar", "Sorting Algorithms", "64", "76%", "Needs review", "amber"],
-    ["Sana Iyer", "Data Structures", "78", "91%", "Scored", "green"],
-  ];
+  const storedAssessments = facultyRecords.filter((record) => record.assessment);
+  const assessments = storedAssessments.length
+    ? storedAssessments.map((record) => [
+        record.profile?.full_name || "Student",
+        record.evaluation_name,
+        String(record.score ?? "--"),
+        "Reviewed",
+        record.passed === record.total ? "Scored" : "Needs review",
+        record.passed === record.total ? "green" : "amber",
+        record.assessment,
+      ])
+    : submissionResult
+      ? [[
+          studentProfile?.full_name || "Student",
+          activeEvaluation.name,
+          String(submissionResult.score),
+          "Reviewed",
+          submissionResult.passed === submissionResult.total ? "Scored" : "Needs review",
+          submissionResult.passed === submissionResult.total ? "green" : "amber",
+          null,
+        ]]
+      : [];
+  const assessmentRows = storedAssessments.map((record) => record.assessment);
+  const average = (field) => assessmentRows.length
+    ? Math.round(assessmentRows.reduce((sum, item) => sum + Number(item[field] || 0), 0) / assessmentRows.length)
+    : null;
+  const skillScore = average("skill_score");
+  const performanceScore = assessmentRows.length
+    ? Math.round(assessmentRows.filter((item) => item.performance_prediction === "Good").length / assessmentRows.length * 100)
+    : null;
+  const plagiarismScore = average("plagiarism_score");
+  const behaviorScore = average("debugging_score");
+  const latestAssessment = assessments.find((assessment) => assessment[0] === selected)?.[6] || assessments[0]?.[6];
   const current =
     assessments.find((assessment) => assessment[0] === selected) ||
-    assessments[0];
+    assessments[0] ||
+    ["No assessment selected", "Run an assessment to view results", "--", "--", "Not available", "amber"];
   const runAssessment = () => {
     setRunning(true);
     window.setTimeout(() => setRunning(false), 1100);
@@ -2440,28 +3982,28 @@ function AssessmentView() {
         <div className="assessment-stat">
           <span className="assessment-icon">✦</span>
           <div>
-            <strong>94%</strong>
+            <strong>--</strong>
             <small>AI confidence</small>
           </div>
         </div>
         <div className="assessment-stat">
           <span className="assessment-icon blue-stat">▤</span>
           <div>
-            <strong>68</strong>
+            <strong>{submissionResult ? "1" : "--"}</strong>
             <small>Submissions assessed</small>
           </div>
         </div>
         <div className="assessment-stat">
           <span className="assessment-icon yellow-stat">◌</span>
           <div>
-            <strong>11</strong>
+            <strong>--</strong>
             <small>Review recommendations</small>
           </div>
         </div>
         <div className="assessment-stat">
           <span className="assessment-icon coral-stat">◇</span>
           <div>
-            <strong>02</strong>
+            <strong>--</strong>
             <small>Originality flags</small>
           </div>
         </div>
@@ -2471,33 +4013,33 @@ function AssessmentView() {
           <div className="panel-heading">
             <div>
               <h2>ML model health</h2>
-              <p>Production models · Last retrained 28 Aug 2026</p>
+              <p>Model metrics will appear after real assessments are processed.</p>
             </div>
-            <span className="status green">All systems healthy</span>
+            <span className={`status ${assessmentRows.length ? "green" : "amber"}`}>{assessmentRows.length ? "Live assessment data" : "No model data"}</span>
           </div>
           <div className="model-health-grid">
             <ModelMetric
               label="Skill prediction"
-              score="96.2%"
-              detail="accuracy"
+              score={skillScore == null ? "--" : `${skillScore}%`}
+              detail={skillScore == null ? "No data" : `${assessmentRows.length} assessment${assessmentRows.length === 1 ? "" : "s"}`}
               tone="green"
             />
             <ModelMetric
               label="Performance prediction"
-              score="89.7%"
-              detail="accuracy"
+              score={performanceScore == null ? "--" : `${performanceScore}%`}
+              detail={performanceScore == null ? "No data" : "Predicted good performance"}
               tone="blue"
             />
             <ModelMetric
               label="Plagiarism detection"
-              score="98.4%"
-              detail="precision"
+              score={plagiarismScore == null ? "--" : `${plagiarismScore}%`}
+              detail={plagiarismScore == null ? "No data" : "Average code similarity"}
               tone="yellow"
             />
             <ModelMetric
               label="Behavior analysis"
-              score="91.8%"
-              detail="confidence"
+              score={behaviorScore == null ? "--" : `${behaviorScore}%`}
+              detail={behaviorScore == null ? "No data" : "Debugging efficiency"}
               tone="coral"
             />
           </div>
@@ -2510,8 +4052,8 @@ function AssessmentView() {
             </div>
             <span className="forecast-arrow">↗</span>
           </div>
-          <strong>81.6</strong>
-          <span className="forecast-copy">Predicted class average</span>
+          <strong>{performanceScore == null ? "--" : `${performanceScore}%`}</strong>
+          <span className="forecast-copy">{performanceScore == null ? "No forecast available" : "Based on processed assessments"}</span>
           <div className="forecast-graph">
             <i />
             <i />
@@ -2522,10 +4064,10 @@ function AssessmentView() {
           </div>
           <div className="forecast-foot">
             <span>
-              Current <b>78.4</b>
+              Current <b>{skillScore == null ? "--" : `${skillScore}%`}</b>
             </span>
             <span>
-              Confidence <b>87%</b>
+              Confidence <b>{assessmentRows.length ? "Recorded" : "--"}</b>
             </span>
           </div>
         </div>
@@ -2537,14 +4079,16 @@ function AssessmentView() {
               <h2>Assessment queue</h2>
               <p>CS301 · Current submissions</p>
             </div>
-            <span className="status green">AI engine online</span>
+            <span className={`status ${submissionResult ? "green" : "amber"}`}>
+              {submissionResult ? "Submission received" : "No submissions"}
+            </span>
           </div>
           <div className="assessment-head">
             <span>STUDENT</span>
             <span>SCORE</span>
             <span>AI STATUS</span>
           </div>
-          {assessments.map((assessment) => (
+          {assessments.length ? assessments.map((assessment) => (
             <button
               className={`assessment-row ${selected === assessment[0] ? "selected" : ""}`}
               onClick={() => setSelected(assessment[0])}
@@ -2568,7 +4112,7 @@ function AssessmentView() {
               </strong>
               <span className={`status ${assessment[5]}`}>{assessment[4]}</span>
             </button>
-          ))}
+          )) : <div className="history-empty">No assessments available yet</div>}
         </div>
         <div className="panel assessment-detail">
           <div className="panel-heading">
@@ -2584,26 +4128,26 @@ function AssessmentView() {
               <span>Overall score</span>
             </div>
             <div className="rubric-score-list">
-              <ScoreBar label="Problem understanding" value="88%" width="88%" />
-              <ScoreBar label="Algorithm design" value="82%" width="82%" />
-              <ScoreBar label="Code efficiency" value="76%" width="76%" />
+              <ScoreBar label="Programming skill" value={latestAssessment?.skill_score == null ? "--" : `${latestAssessment.skill_score}/100`} width={`${latestAssessment?.skill_score || 0}%`} />
+              <ScoreBar label="Debugging skill" value={latestAssessment?.debugging_score == null ? "--" : `${latestAssessment.debugging_score}/100`} width={`${latestAssessment?.debugging_score || 0}%`} />
+              <ScoreBar label="Code quality" value={latestAssessment?.code_quality_score == null ? "--" : `${latestAssessment.code_quality_score}/100`} width={`${latestAssessment?.code_quality_score || 0}%`} />
             </div>
           </div>
           <div className="signal-grid">
             <div>
               <span>✦</span>
               <strong>Skill prediction</strong>
-              <small>Strong algorithmic reasoning</small>
+              <small>{latestAssessment?.skill_score == null ? "No data available" : `${latestAssessment.skill_score}/100`}</small>
             </div>
             <div>
               <span>◌</span>
               <strong>Behavior analysis</strong>
-              <small>Consistent iteration pattern</small>
+              <small>{latestAssessment?.debugging_score == null ? "No data available" : `${latestAssessment.debugging_score}/100`}</small>
             </div>
             <div>
               <span>◇</span>
               <strong>Plagiarism detection</strong>
-              <small>92% code similarity clear</small>
+              <small>{latestAssessment?.plagiarism_score == null ? "No data available" : `${latestAssessment.plagiarism_score}% similarity`}</small>
             </div>
           </div>
           <button className="review-button">
@@ -3406,36 +4950,11 @@ function CompilationView() {
     </div>
   );
 }
-function MonitoringView() {
-  const [selected, setSelected] = useState("Aarav Shah");
-  const sessions = [
-    [
-      "Aarav Shah",
-      "AS",
-      "Binary Search Tree",
-      "Editing code",
-      "12:04",
-      "amber",
-    ],
-    [
-      "Maya Patel",
-      "MP",
-      "File I/O & Exceptions",
-      "Compiled successfully",
-      "11:58",
-      "green",
-    ],
-    [
-      "Rohan Kumar",
-      "RK",
-      "Sorting Algorithms",
-      "Idle for 2 min",
-      "11:54",
-      "red",
-    ],
-    ["Sana Iyer", "SI", "Data Structures", "Running tests", "11:49", "green"],
-    ["Vivaan Rao", "VR", "Graph Traversal", "Editing code", "11:43", "amber"],
-  ];
+function MonitoringView({ activities = [] }) {
+  const [selected, setSelected] = useState(activities[0]?.name || "");
+  const compiledCount = activities.filter((activity) => activity.status === "Compiled").length;
+  const attentionCount = activities.filter((activity) => activity.status === "Review needed").length;
+  const compileRate = activities.length ? Math.round((compiledCount / activities.length) * 100) : 0;
   return (
     <div className="module-view monitoring-view">
       <div className="module-view-heading">
@@ -3458,28 +4977,28 @@ function MonitoringView() {
         <div className="monitor-stat">
           <span className="monitor-stat-icon">◉</span>
           <div>
-            <strong>24</strong>
-            <small>Students coding now</small>
+            <strong>{activities.length}</strong>
+            <small>Recent submissions</small>
           </div>
         </div>
         <div className="monitor-stat">
           <span className="monitor-stat-icon blue-stat">↗</span>
           <div>
-            <strong>186</strong>
-            <small>Edits in last 10 min</small>
+            <strong>—</strong>
+            <small>Edit telemetry unavailable</small>
           </div>
         </div>
         <div className="monitor-stat">
           <span className="monitor-stat-icon yellow-stat">▷</span>
           <div>
-            <strong>92%</strong>
+            <strong>{compileRate}%</strong>
             <small>Compile success rate</small>
           </div>
         </div>
         <div className="monitor-stat">
           <span className="monitor-stat-icon coral-stat">!</span>
           <div>
-            <strong>03</strong>
+            <strong>{attentionCount}</strong>
             <small>Attention signals</small>
           </div>
         </div>
@@ -3498,105 +5017,76 @@ function MonitoringView() {
             <span>ACTIVITY</span>
             <span>LAST EVENT</span>
           </div>
-          {sessions.map((session) => (
+          {activities.length ? activities.map((activity) => (
             <button
-              className={`session-row ${selected === session[0] ? "selected" : ""}`}
-              onClick={() => setSelected(session[0])}
-              key={session[0]}
+              className={`session-row ${selected === activity.name ? "selected" : ""}`}
+              onClick={() => setSelected(activity.name)}
+              key={`${activity.name}-${activity.time}-${activity.task}`}
             >
               <span className="session-person">
-                <span className={`avatar session-avatar ${session[5]}`}>
-                  {session[1]}
+                <span className={`avatar session-avatar ${activity.tone}`}>
+                  {activity.initials}
                 </span>
                 <span>
-                  <strong>{session[0]}</strong>
-                  <small>{session[2]}</small>
+                  <strong>{activity.name}</strong>
+                  <small>{activity.task}</small>
                 </span>
               </span>
-              <span className={`session-activity ${session[5]}`}>
+              <span className={`session-activity ${activity.tone}`}>
                 <i />
-                {session[3]}
+                {activity.status}
               </span>
               <span className="session-time">
-                {session[4]}
+                {activity.time}
                 <b>›</b>
               </span>
             </button>
-          ))}
+          )) : <div className="activity-empty">No submission activity yet</div>}
         </div>
         <div className="panel session-detail">
           <div className="panel-heading">
             <div>
-              <h2>{selected}</h2>
-              <p>Live code preview · bst.py</p>
+              <h2>{selected || "No selected activity"}</h2>
+              <p>{selected ? "Submission activity" : "Real student activity will appear here"}</p>
             </div>
-            <span className="status amber">Editing</span>
+            <span className="status green">Database data</span>
           </div>
           <div className="detail-meta">
             <span>
-              <b>⌁</b> 42 keystrokes
+              <b>⌁</b> Edit telemetry unavailable
             </span>
             <span>
-              <b>↗</b> 3 test runs
+              <b>↗</b> Submission results stored
             </span>
             <span>
-              <b>◷</b> 18 min active
+              <b>◷</b> Timestamp stored
             </span>
-          </div>
-          <div className="code-editor monitor-editor">
-            <div className="editor-top">
-              <span>bst.py</span>
-              <span>Python 3.12</span>
-            </div>
-            <pre>
-              <code>
-                <span className="line-number">7</span>{" "}
-                <span className="code-keyword">def</span> insert(self, value):
-                <br />
-                <span className="line-number">8</span>{" "}
-                <span className="code-keyword">if</span> value &lt; self.value:
-                <br />
-                <span className="line-number">9</span> self.left = Node(value)
-                <br />
-                <span className="line-number">10</span>{" "}
-                <span className="code-keyword">else</span>:<br />
-                <span className="line-number">11</span> self.right = Node(value)
-                <br />
-                <span className="line-number">12</span>
-                <br />
-                <span className="line-number">13</span>{" "}
-                <span className="code-comment">
-                  # AI signal: efficient branching
-                </span>
-              </code>
-            </pre>
           </div>
           <div className="detail-timeline">
             <strong>Recent signals</strong>
-            <span>
-              <i className="timeline-dot green" />
-              Test run passed · 12 cases <b>1m ago</b>
-            </span>
-            <span>
-              <i className="timeline-dot amber" />
-              Large edit block detected <b>3m ago</b>
-            </span>
+            {selected ? <span><i className="timeline-dot green" />Submission loaded from Supabase</span> : <span>No signals recorded</span>}
           </div>
         </div>
       </section>
     </div>
   );
 }
-function AdminSidebar({ active, onNavigate, onLogout }) {
-  const items = [
-    ["overview", "▦", "Dashboard"],
-    ["students", "◉", "Students"],
-    ["faculty", "◎", "Faculty"],
-    ["labs", "▱", "Labs"],
-    ["assessment", "✓", "Evaluations"],
-    ["analytics", "✦", "AI Analytics"],
-    ["reports", "▤", "Reports"],
-  ];
+function AdminSidebar({ active, onNavigate, onLogout, userRole }) {
+  const items = userRole === "admin"
+    ? [
+        ["overview", "▦", "Dashboard"],
+        ["students", "◉", "Students"],
+        ["faculty", "◎", "Faculty"],
+        ["reports", "▤", "Reports"],
+      ]
+    : [
+        ["faculty", "▦", "Dashboard"],
+        ["students", "◉", "Students"],
+      ["labs", "▱", "Labs"],
+        ["monitoring", "◉", "Live monitoring"],
+        ["assessment", "✓", "Evaluations"],
+        ["reports", "▤", "Reports"],
+      ];
   return (
     <aside className="sidebar admin-sidebar">
       <div className="brand">
@@ -3606,7 +5096,7 @@ function AdminSidebar({ active, onNavigate, onLogout }) {
       <div className="admin-school">
         <span className="school-dot" /> Computer Science Lab
       </div>
-      <div className="side-label">ADMIN WORKSPACE</div>
+      <div className="side-label">{userRole === "admin" ? "ADMIN WORKSPACE" : "FACULTY WORKSPACE"}</div>
       <nav>
         {items.map(([id, icon, label], index) => (
           <button
@@ -3630,8 +5120,8 @@ function AdminSidebar({ active, onNavigate, onLogout }) {
       <div className="sidebar-footer">
         <div className="avatar user-avatar">DR</div>
         <div>
-          <strong>Administrator</strong>
-          <small>Admin workspace</small>
+          <strong>{userRole === "admin" ? "Administrator" : "Faculty member"}</strong>
+          <small>{userRole === "admin" ? "Admin workspace" : "Faculty workspace"}</small>
         </div>
         <button className="admin-logout" onClick={onLogout}>
           ↪
@@ -3640,7 +5130,7 @@ function AdminSidebar({ active, onNavigate, onLogout }) {
     </aside>
   );
 }
-function StudentSidebar({ active, onNavigate, onLogout, profile }) {
+function StudentSidebar({ active, onNavigate, onLogout, profile, evaluationSubmitted }) {
   const items = [
     ["dashboard", "▦", "Dashboard"],
     ["labs", "▤", "My labs"],
@@ -3671,7 +5161,7 @@ function StudentSidebar({ active, onNavigate, onLogout, profile }) {
             key={id}
           >
             {icon} <span>{label}</span>
-            {id === "evaluation" && <em>1</em>}
+            {id === "evaluation" && !evaluationSubmitted && <em>1</em>}
           </button>
         ))}
       </nav>
@@ -3704,14 +5194,21 @@ function StudentView({
   studentTab,
   setStudentTab,
   activeEvaluation,
+  publishedEvaluations,
   evaluationSubmitted,
   submissionResult,
+  submissionError,
   setStudentEvaluation,
   profile,
+  onActivity,
+  aiAssessment,
   onSubmit,
 }) {
+  const [language, setLanguage] = useState("python");
+  const [editCount, setEditCount] = useState(0);
+  const [keystrokes, setKeystrokes] = useState(0);
+  const [startedAt] = useState(() => Date.now());
   const [runState, setRunState] = useState("Run code");
-  const [submitted, setSubmitted] = useState(false);
   const [started, setStarted] = useState(false);
   const [evaluationStatus, setEvaluationStatus] = useState("Not started");
   const [remainingSeconds, setRemainingSeconds] = useState(
@@ -3720,6 +5217,11 @@ function StudentView({
   const [compileMessage, setCompileMessage] = useState("");
   const [runSummary, setRunSummary] = useState("");
   const [caseResults, setCaseResults] = useState([]);
+  const [showDetailedFeedback, setShowDetailedFeedback] = useState(false);
+  const submitStartedRef = useRef(false);
+  const [aiFeedback, setAiFeedback] = useState("");
+  const [aiFeedbackLoading, setAiFeedbackLoading] = useState(false);
+  const [aiFeedbackError, setAiFeedbackError] = useState("");
   const [code, setCode] = useState(
     "def sortArray(nums: list[int]) -> list[int]:\n    # Base case: A list of 0 or 1 elements is already sorted\n    if len(nums) <= 1:\n        return nums\n\n    # Split the array into two halves\n    mid = len(nums) // 2\n    left_half = sortArray(nums[:mid])\n    right_half = sortArray(nums[mid:])\n\n    # Merge the sorted halves and return\n    return merge(left_half, right_half)\n\ndef merge(left: list[int], right: list[int]) -> list[int]:\n    sorted_array = []\n    i = j = 0\n\n    # Compare elements from both halves and merge them in order\n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            sorted_array.append(left[i])\n            i += 1\n        else:\n            sorted_array.append(right[j])\n            j += 1\n\n    # Gather any remaining elements from the left or right halves\n    sorted_array.extend(left[i:])\n    sorted_array.extend(right[j:])\n\n    return sorted_array",
   );
@@ -3747,32 +5249,58 @@ function StudentView({
     `${String(Math.floor(remainingSeconds / 60)).padStart(2, "0")}:${String(remainingSeconds % 60).padStart(2, "0")}`;
   const passedCount = caseResults.filter((result) => result.matched).length;
   const errorCount = caseResults.filter((result) => !result.matched).length;
+  const progressTotal = submissionResult?.total ?? caseResults.length;
+  const progressPassed = submissionResult?.passed ?? passedCount;
+  const hasProgress = progressTotal > 0;
   const score = submissionResult
     ? `${submissionResult.score}%`
     : caseResults.length
       ? `${Math.round((passedCount / caseResults.length) * 100)}%`
       : "--";
+  const executedPercent = activeEvaluation.testCases
+    ? Math.round((Math.min(progressTotal, activeEvaluation.testCases) / activeEvaluation.testCases) * 100)
+    : 0;
+  const passedPercent = hasProgress
+    ? Math.round((progressPassed / progressTotal) * 100)
+    : 0;
   const displayedErrorCount = submissionResult
     ? submissionResult.total - submissionResult.passed
-    : errorCount;
+    : caseResults.length
+      ? errorCount
+      : "--";
+  const elapsedSeconds = started
+    ? Math.max(0, activeEvaluation.duration * 60 - remainingSeconds)
+    : 0;
   const timeUsed = started
-    ? `${Math.max(0, activeEvaluation.duration - Math.ceil(remainingSeconds / 60))}m`
-    : "0m";
+    ? elapsedSeconds < 60
+      ? `${elapsedSeconds}s`
+      : `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
+    : "--";
   const displayedTimeUsed = submissionResult
-    ? `${submissionResult.timeUsed}m`
+    ? submissionResult.timeUsedSeconds != null
+      ? submissionResult.timeUsedSeconds < 60
+        ? `${submissionResult.timeUsedSeconds}s`
+        : `${Math.floor(submissionResult.timeUsedSeconds / 60)}m ${submissionResult.timeUsedSeconds % 60}s`
+      : submissionResult.timeUsed === 0
+        ? "<1m"
+        : `${submissionResult.timeUsed}m`
     : timeUsed;
   useEffect(() => {
-    if (evaluationStatus === "Completed") {
+    if (evaluationStatus === "Completed" && !submitStartedRef.current) {
+      submitStartedRef.current = true;
       onSubmit({
         passed: passedCount,
         total: caseResults.length,
-        score: Math.round((passedCount / caseResults.length) * 100),
+        score: caseResults.length
+          ? Math.round((passedCount / caseResults.length) * 100)
+          : 0,
         timeUsed: Math.max(
           0,
           activeEvaluation.duration - Math.ceil(remainingSeconds / 60),
         ),
+        timeUsedSeconds: elapsedSeconds,
+        submittedAt: new Date().toISOString(),
       });
-      setStudentTab("results");
     }
   }, [
     evaluationStatus,
@@ -3782,6 +5310,12 @@ function StudentView({
     caseResults.length,
   ]);
   const runCode = async () => {
+    await onActivity("run", {
+      editCount,
+      keystrokes,
+      timeSpentSeconds: Math.round((Date.now() - startedAt) / 1000),
+      language,
+    });
     setStarted(true);
     setEvaluationStatus("In progress");
     setRunState("Running...");
@@ -3829,6 +5363,107 @@ function StudentView({
       setRunState("Passed");
     }, 900);
   };
+  const compileCode = async () => {
+    await onActivity("compile", {
+      editCount,
+      keystrokes,
+      timeSpentSeconds: Math.round((Date.now() - startedAt) / 1000),
+      language,
+    });
+    setRunState("Compiling...");
+    setCompileMessage("");
+    const executableCode = code.split("\n").map((line) => line.split("#")[0]).join("\n");
+    if (language !== "python") {
+      setRunState("Failed");
+      setCompileMessage(`${language.toUpperCase()} compilation requires the isolated execution service.`);
+      return;
+    }
+    if (/\bpass\b/.test(executableCode) || !executableCode.includes("def sortArray")) {
+      setRunState("Failed");
+      setCompileMessage("Compilation failed: define sortArray(nums) and replace incomplete code.");
+      return;
+    }
+    setRunState("Compiled");
+    setRunSummary("Compilation succeeded. Run the published test cases next.");
+  };
+  const requestAiFeedback = async () => {
+    if (showDetailedFeedback) {
+      setShowDetailedFeedback(false);
+      return;
+    }
+    setShowDetailedFeedback(true);
+    if (aiFeedback) return;
+    setAiFeedbackLoading(true);
+    setAiFeedbackError("");
+    const prompt = [
+      "Analyze this student's coding assessment and give concise, actionable feedback.",
+      "Return only these four sections in Markdown: Summary, Strengths, Improvements, Next step.",
+      "Put each section heading on its own line. Use short bullet points for Strengths and Improvements.",
+      "Do not discuss the requested format, do not critique the feedback instructions, and do not add other sections.",
+      "Only say that no code was submitted if the Student code field below explicitly says [NO CODE SUBMITTED].",
+      "Do not invent results that are not present in the submission.",
+      `Assessment: ${activeEvaluation.name || "Coding assessment"}`,
+      `Question: ${activeEvaluation.question || "Not provided"}`,
+      `Score: ${caseResults.length ? Math.round((passedCount / caseResults.length) * 100) : "Not submitted"}%`,
+      `Test results: ${JSON.stringify(caseResults || [])}`,
+      "Student code:",
+      code?.trim() || "[NO CODE SUBMITTED]",
+    ].join("\n\n");
+
+    try {
+      const response = await fetch(
+        import.meta.env.VITE_OLLAMA_URL || "http://localhost:11434/api/generate",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: import.meta.env.VITE_OLLAMA_MODEL || "llama3.2",
+            prompt,
+            stream: false,
+          }),
+        },
+      );
+      const data = await response.json();
+      if (!response.ok || data.error) {
+        throw new Error(data.error || "Ollama feedback request failed.");
+      }
+      setAiFeedback(data.response?.trim() || "No feedback was returned.");
+    } catch (error) {
+      setAiFeedbackError(
+        error instanceof Error
+          ? `${error.message} Start Ollama with: ollama run llama3.2`
+          : "Ollama feedback request failed.",
+      );
+    } finally {
+      setAiFeedbackLoading(false);
+    }
+  };
+  const openDetailedReport = () => {
+    setStudentTab("reports");
+    if (!aiFeedback) requestAiFeedback();
+  };
+  const printReport = () => {
+    const reportWindow = window.open("", "_blank", "width=800,height=900");
+    if (!reportWindow) {
+      setAiFeedbackError("Allow pop-ups to print the evaluation report.");
+      return;
+    }
+    const escapeHtml = (value) =>
+      String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;");
+    const result = submissionResult || {
+      score: passedPercent,
+      passed: progressPassed,
+      total: progressTotal,
+    };
+    reportWindow.document.write(`<!doctype html><html><head><title>${escapeHtml(activeEvaluation.name)} report</title><style>body{font-family:Arial,sans-serif;color:#183b36;max-width:760px;margin:40px auto;padding:0 24px}h1{margin-bottom:4px}h2{margin-top:28px;border-bottom:1px solid #dcebe3;padding-bottom:8px}table{width:100%;border-collapse:collapse}td{padding:10px;border-bottom:1px solid #e7efeb}td:last-child{text-align:right;font-weight:bold}pre{white-space:pre-wrap;background:#f3f8f5;padding:16px;border-left:3px solid #66bd9b}</style></head><body><h1>${escapeHtml(activeEvaluation.name)}</h1><p>Evaluation report for ${escapeHtml(studentName)}</p><h2>Result</h2><table><tr><td>Score</td><td>${escapeHtml(result.score)}%</td></tr><tr><td>Tests passed</td><td>${escapeHtml(result.passed)}/${escapeHtml(result.total)}</td></tr></table><h2>AI feedback</h2><pre>${escapeHtml(aiFeedback || "No AI feedback requested.")}</pre></body></html>`);
+    reportWindow.document.close();
+    reportWindow.focus();
+    reportWindow.print();
+  };
   return (
     <div className="student-wrap">
       <section className="student-heading">
@@ -3855,12 +5490,6 @@ function StudentView({
           onClick={() => setStudentTab("dashboard")}
         >
           Dashboard
-        </button>
-        <button
-          className={studentTab === "evaluation" ? "active" : ""}
-          onClick={() => setStudentTab("evaluation")}
-        >
-          Current evaluation <span className="tab-live">LIVE</span>
         </button>
       </div>
       <div className="student-progress">
@@ -3948,7 +5577,7 @@ function StudentView({
           </span>
         </section>
       )}
-      {studentTab === "evaluation" && !evaluationSubmitted && (
+      {studentTab === "evaluation" && started && !evaluationSubmitted && (
         <section className="student-grid">
           <div className="panel coding-panel">
             <div className="panel-heading">
@@ -3968,8 +5597,16 @@ function StudentView({
             </div>
             <div className="code-editor">
               <div className="editor-top">
-                <span>sorting.py</span>
-                <span>Python 3.12</span>
+                <label className="editor-language">
+                  Language
+                  <select value={language} onChange={(event) => setLanguage(event.target.value)}>
+                    <option value="python">Python</option>
+                    <option value="c">C</option>
+                    <option value="cpp">C++</option>
+                    <option value="java">Java</option>
+                  </select>
+                </label>
+                <span>{language === "python" ? "Python 3.12" : `${language.toUpperCase()} sandbox`}</span>
                 <span className="editor-save">Auto-saved</span>
               </div>
               <textarea
@@ -3978,15 +5615,25 @@ function StudentView({
                 value={code}
                 onChange={(event) => {
                   setCode(event.target.value);
+                  setEditCount((count) => count + 1);
+                  setKeystrokes((count) => count + event.nativeEvent.data?.length || count + 1);
                   setRunState("Run code");
                   setCompileMessage("");
                   setRunSummary("");
                   setCaseResults([]);
                   setEvaluationStatus("In progress");
+                  onActivity("edit", { editCount: editCount + 1, keystrokes: keystrokes + 1, language });
                 }}
               />
             </div>
             <div className="code-actions">
+              <button
+                className="secondary-button"
+                onClick={compileCode}
+                disabled={evaluationStatus === "Completed"}
+              >
+                Compile
+              </button>
               <button
                 className="secondary-button"
                 onClick={runCode}
@@ -3998,7 +5645,6 @@ function StudentView({
                 className="primary-button"
                 onClick={() => {
                   if (runState === "Passed") {
-                    setSubmitted(true);
                     setEvaluationStatus("Completed");
                   } else {
                     setCompileMessage(
@@ -4008,7 +5654,7 @@ function StudentView({
                 }}
                 disabled={evaluationStatus === "Completed"}
               >
-                {submitted ? "Submitted" : "Submit solution"}{" "}
+                {evaluationSubmitted ? "Submitted" : "Submit solution"}{" "}
                 <span className="button-arrow">→</span>
               </button>
             </div>
@@ -4051,10 +5697,17 @@ function StudentView({
                 <span>×</span> {compileMessage}
               </div>
             )}
-            {submitted && (
+            {runSummary && runState === "Compiled" && (
+              <div className="compile-result"><span>✓</span> {runSummary}</div>
+            )}
+            {evaluationSubmitted && (
               <div className="notice">
-                <span>✓</span> Solution submitted for AI assessment{" "}
-                <button onClick={() => setSubmitted(false)}>×</button>
+                <span>✓</span> Solution submitted for AI assessment
+              </div>
+            )}
+            {submissionError && (
+              <div className="compile-error">
+                <span>×</span> {submissionError}
               </div>
             )}
           </div>
@@ -4065,19 +5718,44 @@ function StudentView({
                   <h2>Your progress</h2>
                   <p>Current semester</p>
                 </div>
-                <span className="progress-ring">78</span>
+                <span className="progress-ring">
+                  {hasProgress ? passedPercent : "--"}
+                </span>
               </div>
               <div className="score-bars">
                 <ScoreBar
-                  label="Problem understanding"
-                  value="86%"
-                  width="86%"
+                  label="Tests executed"
+                  value={hasProgress ? `${progressTotal}/${activeEvaluation.testCases}` : "--"}
+                  width={`${executedPercent}%`}
                 />
-                <ScoreBar label="Algorithm design" value="74%" width="74%" />
-                <ScoreBar label="Debugging skill" value="68%" width="68%" />
+                <ScoreBar
+                  label="Tests passed"
+                  value={hasProgress ? `${progressPassed}/${progressTotal}` : "--"}
+                  width={`${passedPercent}%`}
+                />
+                <ScoreBar label="Current score" value={score} width={`${passedPercent}%`} />
               </div>
-              <button className="text-button">
-                View detailed feedback <span>→</span>
+              {!hasProgress && (
+                <p className="progress-empty">Run your code to calculate progress.</p>
+              )}
+              {showDetailedFeedback && (
+                <div className="progress-feedback">
+                  <strong>Detailed feedback</strong>
+                  {aiFeedbackLoading ? (
+                    <p>Analyzing your code and test results...</p>
+                  ) : aiFeedbackError ? (
+                    <p>{aiFeedbackError}</p>
+                  ) : (
+                    <StructuredFeedback feedback={aiFeedback || "No feedback available yet."} />
+                  )}
+                </div>
+              )}
+              <button
+                className="text-button"
+                type="button"
+                onClick={requestAiFeedback}
+              >
+                {showDetailedFeedback ? "Hide detailed feedback" : "Get AI feedback"} <span>→</span>
               </button>
             </div>
             <div className="panel feedback-panel">
@@ -4088,10 +5766,10 @@ function StudentView({
                 </div>
                 <span className="ai-spark">✦</span>
               </div>
-              <p className="feedback-quote">
-                “Great problem solving. Consider reducing repeated comparisons
-                in the merge step to improve code efficiency.”
-              </p>
+              <StructuredFeedback
+                className="feedback-quote"
+                feedback={aiFeedback || "AI feedback will appear here after you request an analysis."}
+              />
               <div className="feedback-footer">
                 <span className="avatar feedback-avatar">AI</span>
                 <span>Assessment engine · 4 min ago</span>
@@ -4122,20 +5800,12 @@ function StudentView({
               <span>STATUS</span>
             </div>
             {evaluationSubmitted ? (
-              <>
-                <HistoryRow
-                  name="Sorting Algorithms"
-                  score="100%"
-                  tests="10/10"
-                  date="03 Sep"
-                />
-                <HistoryRow
-                  name="Experiment 2 · Recursion"
-                  score="72%"
-                  tests="7/10"
-                  date="01 Sep"
-                />
-              </>
+              <HistoryRow
+                name={activeEvaluation.name}
+                score={`${submissionResult?.score ?? 0}%`}
+                tests={`${submissionResult?.passed ?? 0}/${submissionResult?.total ?? 0}`}
+                date="Just now"
+              />
             ) : (
               <div className="history-empty">No evaluation history yet</div>
             )}
@@ -4145,8 +5815,8 @@ function StudentView({
               <span>✦</span>
               <div>
                 <strong>AI feedback ready</strong>
-                <p>Your detailed Experiment 2 report is ready to review.</p>
-                <button className="text-button">View report →</button>
+                <p>Your current evaluation report is ready to review.</p>
+                <button className="text-button" onClick={openDetailedReport}>View report →</button>
               </div>
             </div>
             <div className="panel report-panel">
@@ -4157,10 +5827,10 @@ function StudentView({
                 </div>
                 <span className="edit-icon">▤</span>
               </div>
-              <button className="report-button">
+              <button className="report-button" onClick={openDetailedReport}>
                 View detailed report <span>→</span>
               </button>
-              <button className="report-button">
+              <button className="report-button" onClick={printReport}>
                 Download PDF <span>↓</span>
               </button>
             </div>
@@ -4170,6 +5840,16 @@ function StudentView({
       {!["dashboard", "evaluation"].includes(studentTab) && (
         <StudentSection
           section={studentTab}
+          activeEvaluation={activeEvaluation}
+          publishedEvaluations={publishedEvaluations}
+          submissionResult={submissionResult}
+          studentEvaluation={{ code, caseResults }}
+          profile={profile}
+          aiAssessment={aiAssessment}
+          aiFeedback={aiFeedback}
+          aiFeedbackLoading={aiFeedbackLoading}
+          aiFeedbackError={aiFeedbackError}
+          onRequestAiFeedback={requestAiFeedback}
           evaluationStatus={evaluationStatus}
         />
       )}
@@ -4179,8 +5859,16 @@ function StudentView({
 function StudentSection({
   section,
   activeEvaluation,
+  publishedEvaluations,
   submissionResult,
+  submissionError,
   studentEvaluation,
+  profile,
+  aiAssessment,
+  aiFeedback,
+  aiFeedbackLoading,
+  aiFeedbackError,
+  onRequestAiFeedback,
   evaluationStatus,
 }) {
   const currentStatus =
@@ -4200,13 +5888,17 @@ function StudentSection({
       title: "My labs",
       description:
         "Tests assigned by your administrator and available in the laboratory.",
-      rows: [
-        [
-          activeEvaluation.name,
-          `${activeEvaluation.testCases} test cases · ${activeEvaluation.duration} minutes`,
-          evaluationStatus === "Completed" ? "Completed" : "Assigned",
+      rows: (publishedEvaluations?.length ? publishedEvaluations : [activeEvaluation]).map(
+        (evaluation) => [
+          evaluation.name,
+          `${evaluation.testCases || evaluation.cases?.length || 0} test cases · ${evaluation.duration} minutes`,
+          evaluation.name === activeEvaluation.name
+            ? evaluationStatus === "Completed"
+              ? "Completed"
+              : "Active"
+            : "Published",
         ],
-      ],
+      ),
     },
     results: {
       title: "Results",
@@ -4228,25 +5920,29 @@ function StudentSection({
         "Access detailed marks, feedback, and downloadable evaluation records.",
       rows: [
         [
-          "Lab performance report",
-          "Overall score trend and progress snapshot",
-          "Ready",
+          "Download PDF report",
+          "Student, experiment, code, results, AI analysis, rubric, and feedback",
+          "Available",
         ],
-        ["Download PDF", "Evaluation record for faculty review", "Available"],
+        ["Download CSV report", "Spreadsheet-compatible evaluation record", "Available"],
       ],
     },
     profile: {
       title: "Profile",
       description: "Your student identity and laboratory account details.",
       rows: [
-        ["Student name", "Aarav Shah", "Verified"],
-        ["Student ID", "1CS22CS014", "Verified"],
-        ["Department", "Computer Science & Engineering", "Verified"],
-        ["Semester", "5th Semester", "Verified"],
-        ["Laboratory", "Computer Science Lab", "Active"],
+        ["Student name", profile?.full_name || "Not available", "Verified"],
+        ["Student ID", profile?.usn || "Not available", "Verified"],
+        ["Department", profile?.department || "Not available", "Verified"],
+        ["Semester", profile?.semester || "Not available", "Verified"],
+        ["Laboratory", profile?.assigned_lab || "Not available", "Active"],
       ],
     },
-  }[section];
+  }[section] || {
+    title: "Results",
+    description: "Review your marks, performance, and AI evaluation outcomes.",
+    rows: [],
+  };
   const hasRows = content.rows.length > 0;
   const handleReportAction = (reportName) => {
     const outputLines = studentEvaluation.caseResults.flatMap(
@@ -4259,14 +5955,30 @@ function StudentSection({
       ],
     );
     const lines = [
-      reportName === "Download PDF"
-        ? "LabPilot Evaluation Record"
-        : "LabPilot Performance Report",
-      "Student: Aarav Shah",
-      "Student ID: 1CS22CS014",
+      "AI Powered Smart Laboratory Evaluation System",
+      "Student Evaluation Report",
+      `Student: ${profile?.full_name || "Not available"}`,
+      `Student ID: ${profile?.usn || "Not available"}`,
+      `Department: ${profile?.department || "Not available"}`,
+      `Semester: ${profile?.semester || "Not available"}`,
+      `Laboratory: ${profile?.assigned_lab || "Not available"}`,
       `Evaluation: ${activeEvaluation.name}`,
+      `Question: ${activeEvaluation.question}`,
+      `Status: ${evaluationStatus}`,
       `Current score: ${submissionResult?.score || 0}%`,
-      `Evaluation status: ${evaluationStatus}`,
+      `Tests passed: ${submissionResult?.passed || 0}/${submissionResult?.total || studentEvaluation.caseResults.length}`,
+      `Time used: ${submissionResult?.timeUsedSeconds || 0} seconds`,
+      "",
+      "AI analysis:",
+      `Skill score: ${aiAssessment?.skillScore ?? "Not available"}`,
+      `Debugging score: ${aiAssessment?.debuggingScore ?? "Not available"}`,
+      `Code quality score: ${aiAssessment?.codeQualityScore ?? "Not available"}`,
+      `Plagiarism similarity: ${aiAssessment?.plagiarismScore ?? "Not available"}%`,
+      `Performance prediction: ${aiAssessment?.performancePrediction || "Not available"}`,
+      `Feedback: ${aiAssessment?.feedback || aiFeedback || "Not available"}`,
+      `Strengths: ${(aiAssessment?.strengths || []).join("; ") || "Not available"}`,
+      `Weaknesses: ${(aiAssessment?.weaknesses || []).join("; ") || "Not available"}`,
+      `Improvement suggestions: ${(aiAssessment?.weaknesses || []).join("; ") || "Continue practicing published test cases"}`,
       "",
       "Submitted code:",
       ...studentEvaluation.code.split("\n"),
@@ -4274,6 +5986,20 @@ function StudentSection({
       "Test outputs:",
       ...(outputLines.length ? outputLines : ["No test output available"]),
     ];
+    if (reportName === "Download CSV report") {
+      const csvRows = lines.map((line) => [line]);
+      const csv = csvRows
+        .map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(","))
+        .join("\n");
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+      link.download = `${activeEvaluation.name.replace(/\s+/g, "-")}-report.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(link.href);
+      return;
+    }
     const pdf = createPdfBlob(lines);
     const link = document.createElement("a");
     link.href = URL.createObjectURL(pdf);
@@ -4292,15 +6018,22 @@ function StudentSection({
           <h1>{content.title}</h1>
           <p>{content.description}</p>
         </div>
-        <div className="student-section-status">
-          <span
-            className={`status ${currentStatus === "Completed" ? "green" : currentStatus === "In progress" ? "amber" : "red"}`}
-          >
-            {currentStatus}
-          </span>
-          <small>{currentDetail}</small>
-        </div>
+        {section !== "profile" && (
+          <div className="student-section-status">
+            <span
+              className={`status ${currentStatus === "Completed" ? "green" : currentStatus === "In progress" ? "amber" : "red"}`}
+            >
+              {currentStatus}
+            </span>
+            <small>{currentDetail}</small>
+          </div>
+        )}
       </div>
+      {submissionError && section === "results" && (
+        <div className="compile-error">
+          <span>×</span> {submissionError}
+        </div>
+      )}
       <div
         className={`panel student-section-panel ${hasRows ? "has-data" : "empty-data"}`}
       >
@@ -4327,6 +6060,7 @@ function StudentSection({
             <b>→</b>
           </button>
         ))}
+        {section === "reports" && null}
       </div>
     </section>
   );
@@ -4435,8 +6169,4 @@ function Module({ title, subtitle, value, status, tone }) {
   );
 }
 
-createRoot(document.getElementById("root")).render(
-  <StrictMode>
-    <Dashboard />
-  </StrictMode>,
-);
+export default Dashboard;
